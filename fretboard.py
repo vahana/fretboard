@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self._song = None
         self._player = Player()
         self._fretboards: Dict[int, Tuple[QWidget, FretboardWidget]] = {}
+        self._track_events: Dict[int, Tuple[list, float]] = {}
         self._build_ui()
         self._connect()
 
@@ -196,6 +197,7 @@ class MainWindow(QMainWindow):
             self._fb_layout.removeWidget(frame)
             frame.deleteLater()
         self._fretboards.clear()
+        self._track_events.clear()
 
         self._track_list.blockSignals(True)
         self._track_list.clear()
@@ -257,6 +259,7 @@ class MainWindow(QMainWindow):
         self._fb_layout.insertWidget(insert_pos, frame)
         self._fretboards[track_idx] = (frame, fb)
 
+        self._track_events[track_idx] = (events, tempo)
         self._player.load_track(track_idx, events)
         self._seek_slider.setRange(0, int(self._player.total_ms))
         QTimer.singleShot(0, self._resize_to_fit)
@@ -267,6 +270,7 @@ class MainWindow(QMainWindow):
         frame, _ = self._fretboards.pop(track_idx)
         self._fb_layout.removeWidget(frame)
         frame.deleteLater()
+        self._track_events.pop(track_idx, None)
         self._player.remove_track(track_idx)
         self._seek_slider.setRange(0, int(self._player.total_ms))
         QTimer.singleShot(0, self._resize_to_fit)
@@ -307,10 +311,21 @@ class MainWindow(QMainWindow):
             self._seek_slider.blockSignals(True)
             self._seek_slider.setValue(int(ms))
             self._seek_slider.blockSignals(False)
+        for track_idx, (frame, fb) in self._fretboards.items():
+            data = self._track_events.get(track_idx)
+            if data is None:
+                continue
+            events, tempo = data
+            window_ms = 8 * (60000.0 / tempo)  # 2 bars in 4/4
+            lo, hi = ms - window_ms, ms + window_ms
+            ctx = [(e.string, e.fret) for e in events if lo <= e.time_ms <= hi]
+            fb.set_context_notes(ctx)
 
     def _on_finished(self):
         self._player.reset()
         self._play_btn.setText("Play")
+        for _, fb in self._fretboards.values():
+            fb.set_context_notes([])
 
     def _seek_pressed(self):
         self._dragging = True

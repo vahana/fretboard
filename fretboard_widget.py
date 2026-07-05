@@ -25,10 +25,15 @@ class FretboardWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.active_notes: dict = {}
+        self.context_notes: list = []
         self.setMinimumSize(900, 160)
 
     def set_notes(self, notes: dict):
         self.active_notes = notes
+        self.update()
+
+    def set_context_notes(self, notes: list):
+        self.context_notes = notes
         self.update()
 
     # ------------------------------------------------------------------ paint
@@ -49,6 +54,7 @@ class FretboardWidget(QWidget):
         self._draw_nut(p, fb_h)
         self._draw_strings(p, str_gap, fb_w)
         self._draw_labels(p, str_gap, fret_w)
+        self._draw_context_notes(p, str_gap, fret_w)
         self._draw_active_notes(p, str_gap, fret_w)
 
     def _draw_background(self, p, w, h):
@@ -102,6 +108,24 @@ class FretboardWidget(QWidget):
         for fret in range(1, NUM_FRETS + 1):
             cx = ML + (fret - 0.5) * fret_w
             p.drawText(QRectF(cx - 12, 4, 24, 18), Qt.AlignmentFlag.AlignCenter, str(fret))
+
+    def _draw_context_notes(self, p, str_gap, fret_w):
+        r = 9.0
+        pen = QPen(QColor(180, 180, 180, 110), 1.2)
+        lbl_font = QFont('Courier', 7)
+        p.setFont(lbl_font)
+        for string_num, fret_num in self.context_notes:
+            s_idx = string_num - 1
+            if not (0 <= s_idx < NUM_STRINGS):
+                continue
+            y = MT + s_idx * str_gap
+            x = ML - 30 if fret_num == 0 else ML + (fret_num - 0.5) * fret_w
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
+            p.setPen(QPen(QColor(180, 180, 180, 110)))
+            p.drawText(QRectF(x - r, y - r, r * 2, r * 2),
+                       Qt.AlignmentFlag.AlignCenter, str(fret_num))
 
     def _draw_active_notes(self, p, str_gap, fret_w):
         for string_num, note_data in self.active_notes.items():

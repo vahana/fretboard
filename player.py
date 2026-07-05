@@ -256,8 +256,8 @@ class Player(QObject):
             slot = self._pg_slot.get(track_idx)
             if slot is not None:
                 ch = pygame.mixer.Channel(slot * _STRINGS + (ev.string - 1))
-                if ch.get_busy():
-                    ch.stop()
+                ch.stop()
+                ch.set_volume(1.0)
                 ch.play(self._tone_cache[pitch], maxtime=int(ev.duration_ms))
 
         off_ms = ev.time_ms + ev.duration_ms
