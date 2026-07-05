@@ -6,9 +6,11 @@
 #   "PyQt6>=6.6.0",
 #   "pygame>=2.5.0",
 #   "numpy>=1.26.0",
+#   "pyfluidsynth>=1.3.3",
 # ]
 # ///
 
+import os
 import sys
 from typing import Dict, Tuple
 from PyQt6.QtWidgets import (
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
+    QComboBox,
 )
 from PyQt6.QtCore import Qt, QTimer
 
@@ -80,6 +83,34 @@ class MainWindow(QMainWindow):
         self._open_btn = QPushButton("Open GP File…")
         top.addWidget(self._open_btn)
         top.addStretch()
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("Synth", "synth")
+        self._mode_combo.addItem("SoundFont", "fluid")
+        self._mode_combo.setFixedWidth(100)
+        top.addWidget(QLabel("Sound:"))
+        top.addWidget(self._mode_combo)
+        self._guitar_combo = QComboBox()
+        for label, preset in [
+            ("Nylon Guitar",    24),
+            ("Steel Guitar",    25),
+            ("Jazz Guitar",     26),
+            ("Clean Electric",  27),
+            ("Muted Guitar",    28),
+            ("Overdriven",      29),
+            ("Distortion",      30),
+            ("Harmonics",       31),
+        ]:
+            self._guitar_combo.addItem(label, preset)
+        self._guitar_combo.setCurrentIndex(1)   # Steel default
+        self._guitar_combo.setFixedWidth(130)
+        self._guitar_combo.setEnabled(False)
+        top.addWidget(QLabel("Guitar:"))
+        top.addWidget(self._guitar_combo)
+        self._sf_btn = QPushButton("Load SoundFont…")
+        self._sf_lbl = QLabel("No soundfont")
+        self._sf_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        top.addWidget(self._sf_btn)
+        top.addWidget(self._sf_lbl)
         outer.addLayout(top)
 
         # ── middle: track panel + scroll area ────────────────────────────
@@ -150,6 +181,9 @@ class MainWindow(QMainWindow):
 
     def _connect(self):
         self._open_btn.clicked.connect(self._open_file)
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self._guitar_combo.currentIndexChanged.connect(self._on_guitar_changed)
+        self._sf_btn.clicked.connect(self._load_soundfont)
         self._play_btn.clicked.connect(self._toggle_play)
         self._stop_btn.clicked.connect(self._stop)
         self._track_list.itemChanged.connect(self._on_track_toggled)
@@ -159,6 +193,53 @@ class MainWindow(QMainWindow):
         self._player.notes_changed.connect(self._on_notes)
         self._player.position_changed.connect(self._on_position)
         self._player.finished.connect(self._on_finished)
+        self._player.soundfont_changed.connect(self._on_soundfont)
+        self._sync_sf_label()
+        self._guitar_combo.setEnabled(self._player.has_soundfont)
+
+    # ----------------------------------------------------------------- mode
+
+    def _on_mode_changed(self):
+        mode = self._mode_combo.currentData()
+        if mode == 'fluid' and not self._player.has_soundfont:
+            QMessageBox.warning(self, "No SoundFont",
+                                "Load a SoundFont (.sf2) file first.")
+            self._mode_combo.setCurrentIndex(0)
+            return
+        self._player.set_mode(mode)
+        self._guitar_combo.setEnabled(mode == 'fluid')
+
+    def _on_guitar_changed(self):
+        self._player.set_guitar_preset(self._guitar_combo.currentData())
+
+    # ----------------------------------------------------------------- soundfont
+
+    def _load_soundfont(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load SoundFont", "", "SoundFont (*.sf2)"
+        )
+        if not path:
+            return
+        if not self._player.load_soundfont(path):
+            QMessageBox.warning(self, "SoundFont error",
+                                "Could not load soundfont.\n"
+                                "Make sure FluidSynth is installed: brew install fluid-synth")
+
+    def _on_soundfont(self, path: str):
+        self._sync_sf_label(path)
+        if path:
+            self._guitar_combo.setEnabled(True)
+
+    def _sync_sf_label(self, path: str = ''):
+        if path:
+            self._sf_lbl.setText(os.path.basename(path))
+            self._sf_lbl.setStyleSheet("color: #7ecb7e; font-size: 11px;")
+        elif self._player.has_soundfont:
+            self._sf_lbl.setText("Soundfont loaded")
+            self._sf_lbl.setStyleSheet("color: #7ecb7e; font-size: 11px;")
+        else:
+            self._sf_lbl.setText("No soundfont")
+            self._sf_lbl.setStyleSheet("color: #888; font-size: 11px;")
 
     # ----------------------------------------------------------------- file
 
