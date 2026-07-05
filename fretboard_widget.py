@@ -155,13 +155,14 @@ class FretboardWidget(QWidget):
 
             is_palm = fx and fx.palm_mute
             is_hammer = fx and fx.hammer_on
+            is_dead = fx and fx.dead
 
             # 1. slide indicators (behind dot)
             if fx and (fx.slide_in or fx.slide_out):
                 self._draw_slide_lines(p, x, y, r, fx)
 
-            # 2. glow (skip for hammer-on)
-            if not is_hammer:
+            # 2. glow (skip for hammer-on and dead)
+            if not is_hammer and not is_dead:
                 if is_palm:
                     glow = QRadialGradient(x, y, r * 2.2)
                     glow.setColorAt(0, QColor(160, 110, 50, 120))
@@ -175,7 +176,10 @@ class FretboardWidget(QWidget):
                 p.drawEllipse(QRectF(x - r * 2.2, y - r * 2.2, r * 4.4, r * 4.4))
 
             # 3. dot
-            if is_palm:
+            if is_dead:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(160, 155, 150), 1.8))
+            elif is_palm:
                 p.setBrush(QBrush(QColor(100, 82, 55)))
                 p.setPen(QPen(QColor(170, 140, 85), 1.5))
             elif is_hammer:
@@ -189,8 +193,8 @@ class FretboardWidget(QWidget):
             # 4. label
             lbl_font = QFont('Courier', 8, QFont.Weight.Bold)
             p.setFont(lbl_font)
-            p.setPen(QPen(Qt.GlobalColor.white))
-            label = 'PM' if is_palm else str(fret_num)
+            p.setPen(QPen(QColor(160, 155, 150) if is_dead else Qt.GlobalColor.white))
+            label = 'x' if is_dead else ('PM' if is_palm else str(fret_num))
             p.drawText(QRectF(x - r, y - r, r * 2, r * 2), Qt.AlignmentFlag.AlignCenter, label)
 
             # 5. bend arrow

@@ -18,6 +18,7 @@ class NoteEffects:
     vibrato: bool = False
     palm_mute: bool = False
     hammer_on: bool = False
+    dead: bool = False
     bend: List[BendPoint] = field(default_factory=list)
     slide_in: float = 0.0
     slide_out: float = 0.0
@@ -124,6 +125,10 @@ def _parse_note_effects(note, beat) -> NoteEffects:
     vibrato = bool(getattr(ne, 'vibrato', False) or getattr(be, 'vibrato', False))
     palm_mute = bool(getattr(ne, 'palmMute', False))
     hammer_on = bool(getattr(ne, 'hammer', False))
+    try:
+        dead = getattr(note, 'type', None) is not None and note.type.name == 'dead'
+    except Exception:
+        dead = False
 
     bend = _parse_bend(ne)
     slide_in, slide_out = _parse_slides(ne)
@@ -135,6 +140,7 @@ def _parse_note_effects(note, beat) -> NoteEffects:
         vibrato=vibrato,
         palm_mute=palm_mute,
         hammer_on=hammer_on,
+        dead=dead,
         bend=bend,
         slide_in=slide_in,
         slide_out=slide_out,

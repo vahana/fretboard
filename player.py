@@ -74,6 +74,20 @@ def _make_fx_tone(base_pitch: int, duration_ms: float, fx: "NoteEffects") -> "py
     return pygame.mixer.Sound(buffer=(wave * 8000).astype(np.int16).tobytes())
 
 
+def _make_dead_tone() -> "pygame.mixer.Sound":
+    n = int(_SAMPLE_RATE * 0.08)
+    t = np.linspace(0, 0.08, n, endpoint=False)
+    env = np.exp(-t * 60)
+    wave = env * (
+        np.sin(2 * np.pi * 180 * t)
+        + 0.5 * np.sin(2 * np.pi * 320 * t)
+    )
+    peak = np.abs(wave).max()
+    if peak:
+        wave /= peak
+    return pygame.mixer.Sound(buffer=(wave * 6000).astype(np.int16).tobytes())
+
+
 def _make_tone(freq: float) -> "pygame.mixer.Sound":
     t = np.linspace(0, _TONE_SECS, int(_SAMPLE_RATE * _TONE_SECS), endpoint=False)
     env = np.exp(-t * 3.8)
@@ -160,8 +174,10 @@ class Player(QObject):
         self._pg_slot: Dict[int, int] = {}
         self._free_pg: List[int] = list(range(_MAX_PG_TRACKS))
         self._tone_cache: Dict[int, "pygame.mixer.Sound"] = {}
+        self._dead_tone: "pygame.mixer.Sound | None" = None
         if _PG_AUDIO:
             pygame.mixer.set_num_channels(_MAX_PG_TRACKS * _STRINGS)
+            self._dead_tone = _make_dead_tone()
 
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
@@ -310,14 +326,18 @@ class Player(QObject):
         fx = ev.effects
 
         if _PG_AUDIO and track_idx not in self._muted:
-            pitch = max(0, min(127, ev.midi_pitch + self.pitch_offset))
-            has_pitch_fx = fx and (fx.bend or fx.slide_in or fx.slide_out or fx.vibrato)
-            if has_pitch_fx:
-                sound = _make_fx_tone(pitch, ev.duration_ms, fx)
+            is_dead = fx and fx.dead
+            if is_dead:
+                sound = self._dead_tone
             else:
-                if pitch not in self._tone_cache:
-                    self._tone_cache[pitch] = _make_tone(_midi_freq(pitch))
-                sound = self._tone_cache[pitch]
+                pitch = max(0, min(127, ev.midi_pitch + self.pitch_offset))
+                has_pitch_fx = fx and (fx.bend or fx.slide_in or fx.slide_out or fx.vibrato)
+                if has_pitch_fx:
+                    sound = _make_fx_tone(pitch, ev.duration_ms, fx)
+                else:
+                    if pitch not in self._tone_cache:
+                        self._tone_cache[pitch] = _make_tone(_midi_freq(pitch))
+                    sound = self._tone_cache[pitch]
             slot = self._pg_slot.get(track_idx)
             if slot is not None:
                 ch = pygame.mixer.Channel(slot * _STRINGS + (ev.string - 1))
