@@ -114,18 +114,26 @@ class FretboardWidget(QWidget):
         lbl_font = QFont('Courier', 7)
         p.setFont(lbl_font)
         for entry in self.context_notes:
-            string_num, fret_num, is_upcoming = entry if len(entry) == 3 else (*entry, False)
+            if len(entry) == 4:
+                string_num, fret_num, is_upcoming, dist_frac = entry
+            elif len(entry) == 3:
+                string_num, fret_num, is_upcoming = entry
+                dist_frac = 0.0
+            else:
+                string_num, fret_num = entry
+                is_upcoming, dist_frac = False, 0.0
             s_idx = string_num - 1
             if not (0 <= s_idx < NUM_STRINGS):
                 continue
+            alpha = max(0.0, 1.0 - dist_frac ** 0.7)
             y = MT + s_idx * str_gap
             x = ML - 30 if fret_num == 0 else ML + (fret_num - 0.5) * fret_w
             if is_upcoming:
-                stroke = QColor(60,  160,  50, 220)
-                text_c = QColor(80,  190,  70, 230)
+                stroke = QColor(70,  210,  85, int(230 * alpha))
+                text_c = QColor(140, 255, 150, int(240 * alpha))
             else:
-                stroke = QColor(230, 205, 155, 210)
-                text_c = QColor(235, 210, 160, 230)
+                stroke = QColor(230, 205, 155, int(210 * alpha))
+                text_c = QColor(235, 210, 160, int(230 * alpha))
             p.setPen(QPen(stroke, 1.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
