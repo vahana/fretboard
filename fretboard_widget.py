@@ -114,32 +114,45 @@ class FretboardWidget(QWidget):
         lbl_font = QFont('Courier', 7)
         p.setFont(lbl_font)
         for entry in self.context_notes:
-            if len(entry) == 4:
+            if len(entry) == 5:
+                string_num, fret_num, is_upcoming, dist_frac, note_tag = entry
+            elif len(entry) == 4:
                 string_num, fret_num, is_upcoming, dist_frac = entry
+                note_tag = ''
             elif len(entry) == 3:
                 string_num, fret_num, is_upcoming = entry
-                dist_frac = 0.0
+                dist_frac, note_tag = 0.0, ''
             else:
                 string_num, fret_num = entry
-                is_upcoming, dist_frac = False, 0.0
+                is_upcoming, dist_frac, note_tag = False, 0.0, ''
             s_idx = string_num - 1
             if not (0 <= s_idx < NUM_STRINGS):
                 continue
             alpha = max(0.0, 1.0 - dist_frac ** 0.7)
             y = MT + s_idx * str_gap
             x = ML - 30 if fret_num == 0 else ML + (fret_num - 0.5) * fret_w
-            if is_upcoming:
+            if note_tag == 'dead':
+                stroke = QColor(145, 140, 135, int(210 * alpha))
+                text_c = QColor(150, 145, 140, int(220 * alpha))
+                label  = 'x'
+            elif note_tag == 'palm':
+                stroke = QColor(185, 150, 85, int(210 * alpha))
+                text_c = QColor(195, 160, 95, int(220 * alpha))
+                label  = str(fret_num)
+            elif is_upcoming:
                 stroke = QColor(70,  210,  85, int(230 * alpha))
                 text_c = QColor(140, 255, 150, int(240 * alpha))
+                label  = str(fret_num)
             else:
                 stroke = QColor(230, 205, 155, int(210 * alpha))
                 text_c = QColor(235, 210, 160, int(230 * alpha))
+                label  = str(fret_num)
             p.setPen(QPen(stroke, 1.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
             p.setPen(QPen(text_c))
             p.drawText(QRectF(x - r, y - r, r * 2, r * 2),
-                       Qt.AlignmentFlag.AlignCenter, str(fret_num))
+                       Qt.AlignmentFlag.AlignCenter, label)
 
     def _draw_active_notes(self, p, str_gap, fret_w):
         for string_num, note_data in self.active_notes.items():

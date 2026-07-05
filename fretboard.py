@@ -369,7 +369,9 @@ class MainWindow(QMainWindow):
             window_ms = 8 * (60000.0 / tempo)  # 2 bars in 4/4
             lo, hi = ms - window_ms, ms + window_ms
             ctx = [
-                (e.string, e.fret, e.time_ms > ms, abs(e.time_ms - ms) / window_ms)
+                (e.string, e.fret, e.time_ms > ms, abs(e.time_ms - ms) / window_ms,
+                 'dead' if (e.effects and e.effects.dead) else
+                 'palm' if (e.effects and e.effects.palm_mute) else '')
                 for e in events if lo <= e.time_ms <= hi
             ]
             fb.set_context_notes(ctx)
