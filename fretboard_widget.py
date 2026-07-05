@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import Qt, QRectF, QPointF
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QFont, QBrush,
-    QLinearGradient, QRadialGradient,
+    QLinearGradient, QRadialGradient, QPainterPath,
 )
 
 NUM_STRINGS = 6
@@ -11,16 +11,20 @@ STRING_NAMES = ['e', 'B', 'G', 'D', 'A', 'E']
 SINGLE_MARKERS = {3, 5, 7, 9, 15, 17, 19, 21}
 DOUBLE_MARKERS = {12, 24}
 
-ML = 60    # left margin: label + open-note area
+ML = 60
 MR = 20
-MT = 28    # top: fret number row
+MT = 28
 MB = 12
+
+_COLOR_BEND_ARROW  = QColor(255, 210, 80)
+_COLOR_SLIDE       = QColor(150, 220, 150)
+_COLOR_VIBRATO_TXT = QColor(180, 200, 255)
 
 
 class FretboardWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.active_notes: dict[int, int] = {}
+        self.active_notes: dict = {}
         self.setMinimumSize(900, 160)
 
     def set_notes(self, notes: dict):
@@ -86,7 +90,6 @@ class FretboardWidget(QWidget):
 
     def _draw_labels(self, p, str_gap, fret_w):
         p.setPen(QPen(QColor(195, 175, 140)))
-
         name_font = QFont('Courier', 9, QFont.Weight.Bold)
         p.setFont(name_font)
         for s, name in enumerate(STRING_NAMES):
@@ -101,25 +104,105 @@ class FretboardWidget(QWidget):
             p.drawText(QRectF(cx - 12, 4, 24, 18), Qt.AlignmentFlag.AlignCenter, str(fret))
 
     def _draw_active_notes(self, p, str_gap, fret_w):
-        for string_num, fret_num in self.active_notes.items():
+        for string_num, note_data in self.active_notes.items():
+            if isinstance(note_data, tuple):
+                fret_num, fx, bend_now = note_data
+            else:
+                fret_num, fx, bend_now = note_data, None, 0.0
+
             s_idx = string_num - 1
             y = MT + s_idx * str_gap
             x = ML - 30 if fret_num == 0 else ML + (fret_num - 0.5) * fret_w
             r = 11.0
 
-            glow = QRadialGradient(x, y, r * 2.2)
-            glow.setColorAt(0, QColor(255, 60, 60, 130))
-            glow.setColorAt(1, QColor(255, 60, 60, 0))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(glow))
-            p.drawEllipse(QRectF(x - r * 2.2, y - r * 2.2, r * 4.4, r * 4.4))
+            is_palm = fx and fx.palm_mute
+            is_hammer = fx and fx.hammer_on
 
-            p.setBrush(QBrush(QColor(215, 45, 45)))
-            p.setPen(QPen(QColor(255, 190, 190), 1.5))
+            # 1. slide indicators (behind dot)
+            if fx and (fx.slide_in or fx.slide_out):
+                self._draw_slide_lines(p, x, y, r, fx)
+
+            # 2. glow (skip for hammer-on)
+            if not is_hammer:
+                if is_palm:
+                    glow = QRadialGradient(x, y, r * 2.2)
+                    glow.setColorAt(0, QColor(160, 110, 50, 120))
+                    glow.setColorAt(1, QColor(160, 110, 50, 0))
+                else:
+                    glow = QRadialGradient(x, y, r * 2.2)
+                    glow.setColorAt(0, QColor(255, 60, 60, 130))
+                    glow.setColorAt(1, QColor(255, 60, 60, 0))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(glow))
+                p.drawEllipse(QRectF(x - r * 2.2, y - r * 2.2, r * 4.4, r * 4.4))
+
+            # 3. dot
+            if is_palm:
+                p.setBrush(QBrush(QColor(100, 82, 55)))
+                p.setPen(QPen(QColor(170, 140, 85), 1.5))
+            elif is_hammer:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(215, 45, 45), 2.0))
+            else:
+                p.setBrush(QBrush(QColor(215, 45, 45)))
+                p.setPen(QPen(QColor(255, 190, 190), 1.5))
             p.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
 
-            p.setPen(QPen(Qt.GlobalColor.white))
+            # 4. label
             lbl_font = QFont('Courier', 8, QFont.Weight.Bold)
             p.setFont(lbl_font)
-            p.drawText(QRectF(x - r, y - r, r * 2, r * 2),
-                       Qt.AlignmentFlag.AlignCenter, str(fret_num))
+            p.setPen(QPen(Qt.GlobalColor.white))
+            label = 'PM' if is_palm else str(fret_num)
+            p.drawText(QRectF(x - r, y - r, r * 2, r * 2), Qt.AlignmentFlag.AlignCenter, label)
+
+            # 5. bend arrow
+            if abs(bend_now) > 0.05:
+                self._draw_bend_arrow(p, x, y, r, bend_now)
+
+            # 6. vibrato marker
+            if fx and fx.vibrato:
+                vib_font = QFont('Courier', 10, QFont.Weight.Bold)
+                p.setFont(vib_font)
+                p.setPen(QPen(_COLOR_VIBRATO_TXT))
+                p.drawText(QRectF(x - 10, y - r - 18, 20, 14),
+                           Qt.AlignmentFlag.AlignCenter, '~')
+
+    def _draw_bend_arrow(self, p, x, y, r, bend_semitones):
+        arrow_len = abs(bend_semitones) * 11.0
+        if arrow_len < 3:
+            return
+
+        going_up = bend_semitones > 0
+        p.setPen(QPen(_COLOR_BEND_ARROW, 1.8))
+        p.setBrush(QBrush(_COLOR_BEND_ARROW))
+
+        if going_up:
+            base_y = y - r - 2
+            tip_y = base_y - arrow_len
+            p.drawLine(QPointF(x, base_y), QPointF(x, tip_y + 6))
+            head = QPainterPath()
+            head.moveTo(x, tip_y)
+            head.lineTo(x - 4, tip_y + 7)
+            head.lineTo(x + 4, tip_y + 7)
+            head.closeSubpath()
+        else:
+            base_y = y + r + 2
+            tip_y = base_y + arrow_len
+            p.drawLine(QPointF(x, base_y), QPointF(x, tip_y - 6))
+            head = QPainterPath()
+            head.moveTo(x, tip_y)
+            head.lineTo(x - 4, tip_y - 7)
+            head.lineTo(x + 4, tip_y - 7)
+            head.closeSubpath()
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.fillPath(head, QBrush(_COLOR_BEND_ARROW))
+
+    def _draw_slide_lines(self, p, x, y, r, fx):
+        p.setPen(QPen(_COLOR_SLIDE, 1.8))
+        if fx.slide_in:
+            dy = -15 if fx.slide_in > 0 else 15
+            p.drawLine(QPointF(x - r - 15, y + dy), QPointF(x - r, y))
+        if fx.slide_out:
+            dy = -15 if fx.slide_out > 0 else 15
+            p.drawLine(QPointF(x + r, y), QPointF(x + r + 15, y + dy))

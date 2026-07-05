@@ -6,8 +6,8 @@ import guitarpro
 
 @dataclass
 class BendPoint:
-    pos: float     # 0.0–1.0 fraction of note duration
-    value: float   # pitch offset in semitones
+    pos: float
+    value: float
 
 
 @dataclass
@@ -16,17 +16,19 @@ class NoteEffects:
     duration_scale: float = 1.0
     let_ring: bool = False
     vibrato: bool = False
+    palm_mute: bool = False
+    hammer_on: bool = False
     bend: List[BendPoint] = field(default_factory=list)
-    slide_in: float = 0.0    # starting pitch offset in semitones (e.g. -2.5 = from below)
-    slide_out: float = 0.0   # ending pitch offset in semitones
+    slide_in: float = 0.0
+    slide_out: float = 0.0
 
 
 @dataclass
 class NoteEvent:
     time_ms: float
     duration_ms: float
-    string: int          # 1-6, 1 = high e
-    fret: int            # 0 = open
+    string: int
+    fret: int
     midi_pitch: int
     effects: Optional[NoteEffects] = None
 
@@ -120,6 +122,8 @@ def _parse_note_effects(note, beat) -> NoteEffects:
 
     let_ring = bool(getattr(ne, 'letRing', False))
     vibrato = bool(getattr(ne, 'vibrato', False) or getattr(be, 'vibrato', False))
+    palm_mute = bool(getattr(ne, 'palmMute', False))
+    hammer_on = bool(getattr(ne, 'hammer', False))
 
     bend = _parse_bend(ne)
     slide_in, slide_out = _parse_slides(ne)
@@ -129,6 +133,8 @@ def _parse_note_effects(note, beat) -> NoteEffects:
         duration_scale=duration_scale,
         let_ring=let_ring,
         vibrato=vibrato,
+        palm_mute=palm_mute,
+        hammer_on=hammer_on,
         bend=bend,
         slide_in=slide_in,
         slide_out=slide_out,

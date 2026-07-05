@@ -11,12 +11,12 @@ TICK_MS = 16
 _STRINGS = 6
 _MAX_PG_TRACKS = 8
 _MIDI_CHANNELS = [c for c in range(16) if c != 9]
-_GUITAR_PRESET = 25    # GM 0-indexed: Acoustic Steel Guitar
+_GUITAR_PRESET = 25
 _SAMPLE_RATE = 44100
 _TONE_SECS = 2.5
-_BEND_RANGE = 12       # semitones, set via RPN on each channel
+_BEND_RANGE = 12
 _VIBRATO_HZ = 5.5
-_VIBRATO_DEPTH = 0.4   # semitones
+_VIBRATO_DEPTH = 0.4
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -92,9 +92,32 @@ def _interp_bend(points: List[BendPoint], t: float) -> float:
 
 
 def _semitones_to_pb(semitones: float) -> int:
-    """Convert semitones to MIDI pitch-bend value (0–16383, 8192 = centre)."""
     pb = int(8192 + (semitones / _BEND_RANGE) * 8191)
     return max(0, min(16383, pb))
+
+
+def _compute_pitch_offset(fx: Optional[NoteEffects], now: float, start_ms: float, off_ms: float) -> float:
+    if fx is None:
+        return 0.0
+    duration = off_ms - start_ms
+    t = (now - start_ms) / duration if duration > 0 else 1.0
+    t = max(0.0, min(1.0, t))
+
+    semitones = 0.0
+
+    if fx.bend:
+        semitones += _interp_bend(fx.bend, t)
+
+    if fx.slide_in and t < 0.25:
+        semitones += fx.slide_in * (1.0 - t / 0.25)
+
+    if fx.slide_out and t > 0.7:
+        semitones += fx.slide_out * ((t - 0.7) / 0.3)
+
+    if fx.vibrato:
+        semitones += math.sin(2 * math.pi * _VIBRATO_HZ * now / 1000.0) * _VIBRATO_DEPTH
+
+    return semitones
 
 
 # _active[track_idx][string] = (fret, off_ms, midi_pitch, start_ms, effects)
@@ -121,14 +144,12 @@ class Player(QObject):
         self._event_idx: Dict[int, int] = {}
         self._active: Dict[int, Dict[int, _ActiveNote]] = {}
 
-        # pygame slots
         self._pg_slot: Dict[int, int] = {}
         self._free_pg: List[int] = list(range(_MAX_PG_TRACKS))
         self._tone_cache: Dict[int, "pygame.mixer.Sound"] = {}
         if _PG_AUDIO:
             pygame.mixer.set_num_channels(_MAX_PG_TRACKS * _STRINGS)
 
-        # FluidSynth channels
         self._midi_ch: Dict[int, int] = {}
         self._free_midi_ch: List[int] = list(_MIDI_CHANNELS)
         self._fs = None
@@ -169,7 +190,6 @@ class Player(QObject):
             return False
 
     def _set_pb_range(self, ch: int):
-        """Set pitch-bend sensitivity to ±_BEND_RANGE semitones via RPN 0."""
         try:
             self._fs.cc(ch, 101, 0)
             self._fs.cc(ch, 100, 0)
@@ -313,7 +333,7 @@ class Player(QObject):
     def _tick(self):
         now = self._now()
         self.position_changed.emit(now)
-        updates: Dict[int, Dict[int, int]] = {}
+        updates: Dict[int, Dict] = {}
 
         for track_idx, events in self._tracks.items():
             idx = self._event_idx.get(track_idx, len(events))
@@ -331,7 +351,10 @@ class Player(QObject):
             if self._mode == 'fluid':
                 self._apply_fluid_pitch_fx(track_idx, now)
 
-            updates[track_idx] = {s: fret for s, (fret, _, _p, _t, _fx) in self._active[track_idx].items()}
+            updates[track_idx] = {
+                s: (fret, fx, _compute_pitch_offset(fx, now, start_ms, off_ms))
+                for s, (fret, off_ms, _, start_ms, fx) in self._active[track_idx].items()
+            }
 
         self.notes_changed.emit(updates)
 
@@ -363,7 +386,6 @@ class Player(QObject):
         elif self._mode == 'fluid' and self._fs and self._sfid >= 0:
             midi_ch = self._midi_ch.get(track_idx)
             if midi_ch is not None:
-                # apply slide-in: start pitch offset resolves to 0 over the note
                 if fx and fx.slide_in:
                     self._fs.pitch_bend(midi_ch, _semitones_to_pb(fx.slide_in))
                 elif fx and not fx.bend:
@@ -384,7 +406,6 @@ class Player(QObject):
             midi_ch = self._midi_ch.get(track_idx)
             if midi_ch is not None:
                 self._fs.noteoff(midi_ch, pitch)
-                # reset pitch bend if no more pitched notes on this channel
                 if not any(
                     fx and (fx.bend or fx.vibrato or fx.slide_in or fx.slide_out)
                     for (_, _, _, _, fx) in self._active[track_idx].values()
@@ -392,7 +413,6 @@ class Player(QObject):
                     self._fs.pitch_bend(midi_ch, 8192)
 
     def _apply_fluid_pitch_fx(self, track_idx: int, now: float):
-        """Compute and send pitch-bend for the track's channel each tick."""
         ch = self._midi_ch.get(track_idx)
         if ch is None or self._fs is None:
             return
@@ -403,29 +423,9 @@ class Player(QObject):
         for _, off_ms, _, start_ms, fx in self._active[track_idx].values():
             if fx is None:
                 continue
-            duration = off_ms - start_ms
-            t = (now - start_ms) / duration if duration > 0 else 1.0
-            t = max(0.0, min(1.0, t))
-
-            note_s = 0.0
-
-            if fx.bend:
-                note_s += _interp_bend(fx.bend, t)
+            if fx.bend or fx.slide_in or fx.slide_out or fx.vibrato:
+                semitones = _compute_pitch_offset(fx, now, start_ms, off_ms)
                 has_fx = True
-
-            if fx.slide_in and t < 0.25:
-                note_s += fx.slide_in * (1.0 - t / 0.25)
-                has_fx = True
-
-            if fx.slide_out and t > 0.7:
-                note_s += fx.slide_out * ((t - 0.7) / 0.3)
-                has_fx = True
-
-            if fx.vibrato:
-                note_s += math.sin(2 * math.pi * _VIBRATO_HZ * now / 1000.0) * _VIBRATO_DEPTH
-                has_fx = True
-
-            semitones = note_s   # last active string with effects wins
 
         if has_fx:
             self._fs.pitch_bend(ch, _semitones_to_pb(semitones))
