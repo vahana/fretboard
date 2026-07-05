@@ -25,6 +25,13 @@ class NoteEffects:
 
 
 @dataclass
+class BeatEvent:
+    time_ms: float
+    beat_num: int
+    beats_per_bar: int
+
+
+@dataclass
 class NoteEvent:
     time_ms: float
     duration_ms: float
@@ -48,6 +55,34 @@ def load_song(path: str):
             ) from primary_err
         except Exception as gpif_err:
             raise ValueError(str(primary_err)) from gpif_err
+
+
+def parse_beats(song) -> List[BeatEvent]:
+    try:
+        track = song.tracks[0]
+    except (IndexError, AttributeError):
+        return []
+    tempo = song.tempo if getattr(song, 'tempo', None) and song.tempo > 0 else 120
+    quarter_ms = 60_000.0 / tempo
+    events: List[BeatEvent] = []
+    current_ms = 0.0
+    for measure in track.measures:
+        tempo, quarter_ms = _check_measure_tempo(measure, tempo, quarter_ms)
+        try:
+            ts = measure.timeSignature
+            bpb = ts.numerator
+            denom = ts.denominator.value
+        except Exception:
+            bpb, denom = 4, 4
+        beat_dur_ms = quarter_ms * (4.0 / denom)
+        for i in range(bpb):
+            events.append(BeatEvent(
+                time_ms=current_ms + i * beat_dur_ms,
+                beat_num=i + 1,
+                beats_per_bar=bpb,
+            ))
+        current_ms += bpb * beat_dur_ms
+    return events
 
 
 def parse_track(song, track_index: int) -> Tuple[List[NoteEvent], float]:

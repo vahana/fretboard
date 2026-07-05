@@ -2,7 +2,7 @@ import math
 import time
 from typing import Dict, List, Optional, Tuple
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-from parser import NoteEvent, NoteEffects, BendPoint
+from parser import NoteEvent, NoteEffects, BendPoint, BeatEvent
 
 TICK_MS = 16
 _STRINGS = 6
@@ -72,6 +72,17 @@ def _make_fx_tone(base_pitch: int, duration_ms: float, fx: "NoteEffects") -> "py
     if peak:
         wave /= peak
     return pygame.mixer.Sound(buffer=(wave * 8000).astype(np.int16).tobytes())
+
+
+def _make_click(freq: float, duration: float = 0.022) -> "pygame.mixer.Sound":
+    n = int(_SAMPLE_RATE * duration)
+    t = np.linspace(0, duration, n, endpoint=False)
+    env = np.exp(-t * 160)
+    wave = env * np.sin(2 * np.pi * freq * t)
+    peak = np.abs(wave).max()
+    if peak:
+        wave /= peak
+    return pygame.mixer.Sound(buffer=(wave * 11000).astype(np.int16).tobytes())
 
 
 def _make_dead_tone() -> "pygame.mixer.Sound":
@@ -155,6 +166,7 @@ class Player(QObject):
     notes_changed = pyqtSignal(dict)
     position_changed = pyqtSignal(float)
     finished = pyqtSignal()
+    beat_changed = pyqtSignal(int, int)  # beat_num, beats_per_bar
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -175,9 +187,15 @@ class Player(QObject):
         self._free_pg: List[int] = list(range(_MAX_PG_TRACKS))
         self._tone_cache: Dict[int, "pygame.mixer.Sound"] = {}
         self._dead_tone: "pygame.mixer.Sound | None" = None
+        self._metro_events: List[BeatEvent] = []
+        self._metro_idx: int = 0
+        self._metro_on: bool = False
         if _PG_AUDIO:
-            pygame.mixer.set_num_channels(_MAX_PG_TRACKS * _STRINGS)
+            pygame.mixer.set_num_channels(_MAX_PG_TRACKS * _STRINGS + 1)
             self._dead_tone = _make_dead_tone()
+            self._click_hi = _make_click(1400)
+            self._click_lo = _make_click(900)
+            self._click_ch = pygame.mixer.Channel(_MAX_PG_TRACKS * _STRINGS)
 
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
@@ -226,6 +244,14 @@ class Player(QObject):
         else:
             self._muted.discard(track_idx)
 
+    def load_metronome(self, events: List[BeatEvent]):
+        self._metro_events = events
+        now = self._now() if self.is_playing else self._offset_ms
+        self._metro_idx = _find_idx(events, now)
+
+    def set_metronome(self, on: bool):
+        self._metro_on = on
+
     # ----------------------------------------------------------------- playback
 
     def play(self):
@@ -248,6 +274,7 @@ class Player(QObject):
         if self.is_playing:
             self.pause()
         self._offset_ms = 0.0
+        self._metro_idx = 0
         for idx in self._tracks:
             self._event_idx[idx] = 0
             self._active[idx] = {}
@@ -263,6 +290,7 @@ class Player(QObject):
             self._silence_track(idx)
             self._event_idx[idx] = _find_idx(evs, ms)
             self._active[idx] = {}
+        self._metro_idx = _find_idx(self._metro_events, ms)
         self._offset_ms = ms
         self._wall_start = time.monotonic() * 1000.0
         self.notes_changed.emit({idx: {} for idx in self._tracks})
@@ -307,6 +335,17 @@ class Player(QObject):
             }
 
         self.notes_changed.emit(updates)
+
+        if self._metro_on and self._metro_events:
+            while (self._metro_idx < len(self._metro_events) and
+                   self._metro_events[self._metro_idx].time_ms <= now):
+                ev = self._metro_events[self._metro_idx]
+                self._metro_idx += 1
+                if _PG_AUDIO:
+                    sound = self._click_hi if ev.beat_num == 1 else self._click_lo
+                    self._click_ch.stop()
+                    self._click_ch.play(sound)
+                self.beat_changed.emit(ev.beat_num, ev.beats_per_bar)
 
         if self._tracks and all(
             self._event_idx.get(i, 0) >= len(evs) and not self._active.get(i)

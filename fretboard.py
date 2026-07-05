@@ -20,7 +20,8 @@ from PyQt6.QtWidgets import (
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
     QMenu, QCheckBox,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize
+from PyQt6.QtCore import Qt, QTimer, QSize, QRectF
+from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
 
 _PREFS_PATH = Path.home() / ".fretboard.json"
 _MAX_RECENT = 5
@@ -60,7 +61,58 @@ class _SeekSlider(QSlider):
 
 from fretboard_widget import FretboardWidget
 from player import Player
-from parser import load_song, parse_track
+from parser import load_song, parse_track, parse_beats
+
+
+class _BeatIndicator(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._beat = 0
+        self._total = 4
+        self._flash = False
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(self._dim)
+        self.setFixedHeight(24)
+        self.setFixedWidth(90)
+
+    def set_beat(self, beat_num: int, beats_per_bar: int):
+        self._beat = beat_num
+        self._total = beats_per_bar
+        self._flash = True
+        self._flash_timer.start(90)
+        self.setFixedWidth(max(beats_per_bar * 20 + 10, 50))
+        self.update()
+
+    def reset(self):
+        self._beat = 0
+        self._flash = False
+        self.update()
+
+    def _dim(self):
+        self._flash = False
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = 7.0
+        spacing = 18
+        cy = self.height() / 2
+        x0 = (self.width() - self._total * spacing) / 2 + r
+        for i in range(self._total):
+            cx = x0 + i * spacing
+            active = (i + 1) == self._beat and self._flash
+            is_down = (i == 0)
+            if active:
+                col = QColor(255, 90, 60) if is_down else QColor(255, 200, 60)
+                p.setBrush(QBrush(col))
+                p.setPen(Qt.PenStyle.NoPen)
+            else:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                col = QColor(160, 70, 50) if is_down else QColor(120, 110, 70)
+                p.setPen(QPen(col, 1.5))
+            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
 
 
 class MainWindow(QMainWindow):
@@ -163,9 +215,17 @@ class MainWindow(QMainWindow):
         self._pitch_lbl.setFixedWidth(36)
         self._pitch_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        self._metro_btn = QPushButton("Metro")
+        self._metro_btn.setCheckable(True)
+        self._metro_btn.setFixedWidth(56)
+        self._beat_indicator = _BeatIndicator()
+
         ctrl.addWidget(self._play_btn)
         ctrl.addWidget(self._stop_btn)
         ctrl.addWidget(self._pos_lbl)
+        ctrl.addSpacing(8)
+        ctrl.addWidget(self._metro_btn)
+        ctrl.addWidget(self._beat_indicator)
         ctrl.addStretch()
         ctrl.addWidget(QLabel("Pitch:"))
         ctrl.addWidget(self._pitch_down_btn)
@@ -186,9 +246,11 @@ class MainWindow(QMainWindow):
         self._speed_slider.valueChanged.connect(self._on_speed)
         self._seek_slider.sliderPressed.connect(self._seek_pressed)
         self._seek_slider.sliderReleased.connect(self._seek_released)
+        self._metro_btn.toggled.connect(self._on_metro_toggled)
         self._player.notes_changed.connect(self._on_notes)
         self._player.position_changed.connect(self._on_position)
         self._player.finished.connect(self._on_finished)
+        self._player.beat_changed.connect(self._beat_indicator.set_beat)
 
     # ----------------------------------------------------------------- file
 
@@ -235,6 +297,8 @@ class MainWindow(QMainWindow):
         self._seek_slider.setValue(0)
         self._play_btn.setText("Play")
 
+        self._player.load_metronome(parse_beats(self._song))
+        self._beat_indicator.reset()
         self._current_path = path
         self._update_recent(path)
         song_title = getattr(self._song, 'title', '') or Path(path).stem
@@ -348,6 +412,7 @@ class MainWindow(QMainWindow):
     def _stop(self):
         self._player.reset()
         self._play_btn.setText("Play")
+        self._beat_indicator.reset()
 
     def _on_notes(self, track_notes: dict):
         for track_idx, notes in track_notes.items():
@@ -379,6 +444,7 @@ class MainWindow(QMainWindow):
     def _on_finished(self):
         self._player.reset()
         self._play_btn.setText("Play")
+        self._beat_indicator.reset()
         for _, fb in self._fretboards.values():
             fb.set_context_notes([])
 
@@ -388,6 +454,11 @@ class MainWindow(QMainWindow):
     def _seek_released(self):
         self._dragging = False
         self._player.seek(float(self._seek_slider.value()))
+
+    def _on_metro_toggled(self, on: bool):
+        self._player.set_metronome(on)
+        if not on:
+            self._beat_indicator.reset()
 
     def _shift_pitch(self, delta: int):
         self._player.set_pitch_offset(self._player.pitch_offset + delta)
