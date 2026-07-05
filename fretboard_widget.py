@@ -111,19 +111,25 @@ class FretboardWidget(QWidget):
 
     def _draw_context_notes(self, p, str_gap, fret_w):
         r = 9.0
-        pen = QPen(QColor(180, 180, 180, 110), 1.2)
         lbl_font = QFont('Courier', 7)
         p.setFont(lbl_font)
-        for string_num, fret_num in self.context_notes:
+        for entry in self.context_notes:
+            string_num, fret_num, is_upcoming = entry if len(entry) == 3 else (*entry, False)
             s_idx = string_num - 1
             if not (0 <= s_idx < NUM_STRINGS):
                 continue
             y = MT + s_idx * str_gap
             x = ML - 30 if fret_num == 0 else ML + (fret_num - 0.5) * fret_w
-            p.setPen(pen)
+            if is_upcoming:
+                stroke = QColor(60,  160,  50, 220)
+                text_c = QColor(80,  190,  70, 230)
+            else:
+                stroke = QColor(230, 205, 155, 210)
+                text_c = QColor(235, 210, 160, 230)
+            p.setPen(QPen(stroke, 1.5))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QRectF(x - r, y - r, r * 2, r * 2))
-            p.setPen(QPen(QColor(180, 180, 180, 110)))
+            p.setPen(QPen(text_c))
             p.drawText(QRectF(x - r, y - r, r * 2, r * 2),
                        Qt.AlignmentFlag.AlignCenter, str(fret_num))
 

@@ -237,6 +237,9 @@ class MainWindow(QMainWindow):
 
         self._current_path = path
         self._update_recent(path)
+        song_title = getattr(self._song, 'title', '') or Path(path).stem
+        artist = getattr(self._song, 'artist', '')
+        self.setWindowTitle(f"{artist} – {song_title}" if artist else song_title)
 
         state = self._prefs.get("states", {}).get(path)
         if state:
@@ -365,7 +368,7 @@ class MainWindow(QMainWindow):
             events, tempo = data
             window_ms = 8 * (60000.0 / tempo)  # 2 bars in 4/4
             lo, hi = ms - window_ms, ms + window_ms
-            ctx = [(e.string, e.fret) for e in events if lo <= e.time_ms <= hi]
+            ctx = [(e.string, e.fret, e.time_ms > ms) for e in events if lo <= e.time_ms <= hi]
             fb.set_context_notes(ctx)
 
     def _on_finished(self):
