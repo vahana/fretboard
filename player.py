@@ -1,5 +1,5 @@
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from parser import NoteEvent
 
@@ -8,7 +8,6 @@ try:
     import pygame.mixer
     pygame.mixer.pre_init(44100, -16, 1, 1024)
     pygame.mixer.init()
-    pygame.mixer.set_num_channels(16)
     _AUDIO = True
 except Exception:
     _AUDIO = False
@@ -16,6 +15,8 @@ except Exception:
 TICK_MS = 16
 _SAMPLE_RATE = 44100
 _TONE_SECS = 2.5
+_MAX_TRACKS = 8
+_STRINGS = 6
 
 
 def _make_tone(freq: float) -> "pygame.mixer.Sound":
@@ -38,25 +39,27 @@ def _midi_freq(pitch: int) -> float:
 
 
 class Player(QObject):
-    notes_changed = pyqtSignal(dict)
+    notes_changed = pyqtSignal(dict)       # {track_idx: {string: fret}}
     position_changed = pyqtSignal(float)
     finished = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.events: List[NoteEvent] = []
+        self.total_ms = 0.0
         self.is_playing = False
         self._speed = 1.0
         self._offset_ms = 0.0
         self._wall_start = 0.0
-        self._event_idx = 0
-        self._active: Dict[int, tuple] = {}   # string → (fret, off_ms, channel)
+
+        self._tracks: Dict[int, List[NoteEvent]] = {}
+        self._event_idx: Dict[int, int] = {}
+        self._active: Dict[int, Dict[int, Tuple]] = {}
+        self._slots: Dict[int, int] = {}
+        self._free_slots: List[int] = list(range(_MAX_TRACKS))
         self._tone_cache: Dict[int, "pygame.mixer.Sound"] = {}
-        # one dedicated mixer channel per guitar string (strings 1-6)
-        self._channels: Dict[int, Optional["pygame.mixer.Channel"]] = {}
+
         if _AUDIO:
-            for s in range(1, 7):
-                self._channels[s] = pygame.mixer.Channel(s - 1)
+            pygame.mixer.set_num_channels(_MAX_TRACKS * _STRINGS)
 
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
@@ -64,32 +67,42 @@ class Player(QObject):
 
     # ----------------------------------------------------------------- public
 
-    def load(self, events: List[NoteEvent], _tempo: float):
-        self._all_notes_off()
+    def load_track(self, track_idx: int, events: List[NoteEvent]):
+        self._silence_track(track_idx)
+        if track_idx not in self._slots:
+            if not self._free_slots:
+                return
+            self._slots[track_idx] = self._free_slots.pop(0)
         self._cache_tones(events)
-        self.events = events
-        self.total_ms = max((e.time_ms + e.duration_ms for e in events), default=0.0)
-        self.reset()
-
-    def switch_events(self, events: List[NoteEvent]):
-        """Replace event list at the current playback position without stopping."""
+        self._tracks[track_idx] = events
         now = self._now() if self.is_playing else self._offset_ms
-        self._all_notes_off()
-        self._cache_tones(events)
-        self.events = events
-        self.total_ms = max((e.time_ms + e.duration_ms for e in events), default=0.0)
-        self._event_idx = next(
-            (i for i, e in enumerate(events) if e.time_ms >= now),
-            len(events),
-        )
-        self._offset_ms = now
-        if self.is_playing:
-            self._wall_start = time.monotonic() * 1000.0
-        self._active = {}
-        self.notes_changed.emit({})
+        self._event_idx[track_idx] = _find_idx(events, now)
+        self._active[track_idx] = {}
+        self._refresh_total()
+
+    def remove_track(self, track_idx: int):
+        self._silence_track(track_idx)
+        self._tracks.pop(track_idx, None)
+        self._event_idx.pop(track_idx, None)
+        self._active.pop(track_idx, None)
+        slot = self._slots.pop(track_idx, None)
+        if slot is not None:
+            self._free_slots.append(slot)
+            self._free_slots.sort()
+        self._refresh_total()
+
+    def clear_tracks(self):
+        for idx in list(self._tracks):
+            self._silence_track(idx)
+        self._tracks.clear()
+        self._event_idx.clear()
+        self._active.clear()
+        self._slots.clear()
+        self._free_slots = list(range(_MAX_TRACKS))
+        self.total_ms = 0.0
 
     def play(self):
-        if not self.events:
+        if not self._tracks:
             return
         self._wall_start = time.monotonic() * 1000.0
         self.is_playing = True
@@ -101,35 +114,33 @@ class Player(QObject):
         self._offset_ms = self._now()
         self.is_playing = False
         self._timer.stop()
-        self._all_notes_off()
+        for idx in self._tracks:
+            self._silence_track(idx)
 
     def reset(self):
         if self.is_playing:
             self.pause()
         self._offset_ms = 0.0
-        self._event_idx = 0
-        self._active = {}
+        for idx in self._tracks:
+            self._event_idx[idx] = 0
+            self._active[idx] = {}
         self.is_playing = False
-        self.notes_changed.emit({})
+        self.notes_changed.emit({idx: {} for idx in self._tracks})
         self.position_changed.emit(0.0)
 
     def seek(self, ms: float):
         was_playing = self.is_playing
         if was_playing:
             self._timer.stop()
-        self._all_notes_off()
+        for idx, evs in self._tracks.items():
+            self._silence_track(idx)
+            self._event_idx[idx] = _find_idx(evs, ms)
+            self._active[idx] = {}
         self._offset_ms = ms
         self._wall_start = time.monotonic() * 1000.0
-        self._event_idx = next(
-            (i for i, e in enumerate(self.events) if e.time_ms >= ms),
-            len(self.events),
-        )
-        self._active = {}
-        self.notes_changed.emit({})
+        self.notes_changed.emit({idx: {} for idx in self._tracks})
         if was_playing:
             self._timer.start()
-
-    # ----------------------------------------------------------------- private
 
     def set_speed(self, speed: float):
         if self.is_playing:
@@ -137,41 +148,61 @@ class Player(QObject):
             self._wall_start = time.monotonic() * 1000.0
         self._speed = max(0.1, speed)
 
+    # ----------------------------------------------------------------- private
+
     def _now(self) -> float:
         return self._offset_ms + (time.monotonic() * 1000.0 - self._wall_start) * self._speed
 
     def _tick(self):
         now = self._now()
         self.position_changed.emit(now)
+        updates: Dict[int, Dict[int, int]] = {}
 
-        while (self._event_idx < len(self.events)
-               and self.events[self._event_idx].time_ms <= now):
-            self._note_on(self.events[self._event_idx])
-            self._event_idx += 1
+        for track_idx, events in self._tracks.items():
+            idx = self._event_idx.get(track_idx, len(events))
+            while idx < len(events) and events[idx].time_ms <= now:
+                self._note_on(track_idx, events[idx])
+                idx += 1
+            self._event_idx[track_idx] = idx
 
-        done = []
-        for string, (fret, off_ms, ch) in self._active.items():
-            if now >= off_ms:
+            done = [s for s, (_, off_ms, _ch) in self._active[track_idx].items()
+                    if now >= off_ms]
+            for s in done:
+                _, _, ch = self._active[track_idx].pop(s)
                 if ch:
                     ch.fadeout(60)
-                done.append(string)
-        for s in done:
-            del self._active[s]
 
-        self.notes_changed.emit({s: fret for s, (fret, _, _) in self._active.items()})
+            updates[track_idx] = {s: fret for s, (fret, _, _) in self._active[track_idx].items()}
 
-        if self._event_idx >= len(self.events) and not self._active:
+        self.notes_changed.emit(updates)
+
+        if self._tracks and all(
+            self._event_idx.get(i, 0) >= len(evs) and not self._active.get(i)
+            for i, evs in self._tracks.items()
+        ):
             self._timer.stop()
             self.is_playing = False
             self.finished.emit()
 
-    def _note_on(self, ev: NoteEvent):
-        ch = self._channels.get(ev.string)
+    def _note_on(self, track_idx: int, ev: NoteEvent):
+        ch = self._channel(track_idx, ev.string)
         if _AUDIO and ch and ev.midi_pitch in self._tone_cache:
             if ch.get_busy():
                 ch.stop()
             ch.play(self._tone_cache[ev.midi_pitch])
-        self._active[ev.string] = (ev.fret, ev.time_ms + ev.duration_ms, ch)
+        self._active[track_idx][ev.string] = (ev.fret, ev.time_ms + ev.duration_ms, ch)
+
+    def _channel(self, track_idx: int, string: int) -> Optional["pygame.mixer.Channel"]:
+        slot = self._slots.get(track_idx)
+        if slot is None or not _AUDIO:
+            return None
+        return pygame.mixer.Channel(slot * _STRINGS + (string - 1))
+
+    def _silence_track(self, track_idx: int):
+        for _, _, ch in self._active.get(track_idx, {}).values():
+            if ch:
+                ch.fadeout(80)
+        self._active[track_idx] = {}
 
     def _cache_tones(self, events: List[NoteEvent]):
         if _AUDIO:
@@ -179,9 +210,20 @@ class Player(QObject):
                 if pitch not in self._tone_cache:
                     self._tone_cache[pitch] = _make_tone(_midi_freq(pitch))
 
-    def _all_notes_off(self):
-        if _AUDIO:
-            for ch in self._channels.values():
-                if ch:
-                    ch.fadeout(80)
-        self._active = {}
+    def _refresh_total(self):
+        self.total_ms = max(
+            (max((e.time_ms + e.duration_ms for e in evs), default=0.0)
+             for evs in self._tracks.values()),
+            default=0.0,
+        )
+
+    def __del__(self):
+        try:
+            if _AUDIO:
+                pygame.mixer.quit()
+        except Exception:
+            pass
+
+
+def _find_idx(events: List[NoteEvent], ms: float) -> int:
+    return next((i for i, e in enumerate(events) if e.time_ms >= ms), len(events))
