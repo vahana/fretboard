@@ -1,18 +1,22 @@
 import glob
+import math
 import os
 import time
 import platform
-from typing import List, Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-from parser import NoteEvent
+from parser import NoteEvent, NoteEffects, BendPoint
 
 TICK_MS = 16
 _STRINGS = 6
 _MAX_PG_TRACKS = 8
 _MIDI_CHANNELS = [c for c in range(16) if c != 9]
-_GUITAR_PRESET_DEFAULT = 25   # GM 0-indexed: Acoustic Steel Guitar
+_GUITAR_PRESET = 25    # GM 0-indexed: Acoustic Steel Guitar
 _SAMPLE_RATE = 44100
 _TONE_SECS = 2.5
+_BEND_RANGE = 12       # semitones, set via RPN on each channel
+_VIBRATO_HZ = 5.5
+_VIBRATO_DEPTH = 0.4   # semitones
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -71,11 +75,37 @@ def _audio_driver() -> str:
     return 'coreaudio' if platform.system() == 'Darwin' else 'alsa'
 
 
+def _interp_bend(points: List[BendPoint], t: float) -> float:
+    if not points:
+        return 0.0
+    if t <= points[0].pos:
+        return points[0].value
+    if t >= points[-1].pos:
+        return points[-1].value
+    for i in range(len(points) - 1):
+        p0, p1 = points[i], points[i + 1]
+        if p0.pos <= t <= p1.pos:
+            span = p1.pos - p0.pos
+            frac = (t - p0.pos) / span if span else 1.0
+            return p0.value + frac * (p1.value - p0.value)
+    return points[-1].value
+
+
+def _semitones_to_pb(semitones: float) -> int:
+    """Convert semitones to MIDI pitch-bend value (0–16383, 8192 = centre)."""
+    pb = int(8192 + (semitones / _BEND_RANGE) * 8191)
+    return max(0, min(16383, pb))
+
+
+# _active[track_idx][string] = (fret, off_ms, midi_pitch, start_ms, effects)
+_ActiveNote = Tuple[int, float, int, float, Optional[NoteEffects]]
+
+
 class Player(QObject):
     notes_changed = pyqtSignal(dict)
     position_changed = pyqtSignal(float)
     finished = pyqtSignal()
-    soundfont_changed = pyqtSignal(str)   # path, or '' on failure
+    soundfont_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -84,13 +114,12 @@ class Player(QObject):
         self._speed = 1.0
         self._offset_ms = 0.0
         self._wall_start = 0.0
-        self._mode = 'synth'          # 'synth' | 'fluid'
-        self._guitar_preset = _GUITAR_PRESET_DEFAULT
+        self._mode = 'synth'
+        self._guitar_preset = _GUITAR_PRESET
 
         self._tracks: Dict[int, List[NoteEvent]] = {}
         self._event_idx: Dict[int, int] = {}
-        # [track_idx][string] = (fret, off_ms, midi_pitch)
-        self._active: Dict[int, Dict[int, Tuple]] = {}
+        self._active: Dict[int, Dict[int, _ActiveNote]] = {}
 
         # pygame slots
         self._pg_slot: Dict[int, int] = {}
@@ -111,7 +140,7 @@ class Player(QObject):
         self._timer.setInterval(TICK_MS)
         self._timer.timeout.connect(self._tick)
 
-    # ----------------------------------------------------------------- synth
+    # ----------------------------------------------------------------- synth init
 
     def _init_synth(self):
         try:
@@ -134,9 +163,22 @@ class Player(QObject):
             self._sfid = sfid
             for ch in _MIDI_CHANNELS:
                 self._fs.program_select(ch, self._sfid, 0, self._guitar_preset)
+                self._set_pb_range(ch)
             return True
         except Exception:
             return False
+
+    def _set_pb_range(self, ch: int):
+        """Set pitch-bend sensitivity to ±_BEND_RANGE semitones via RPN 0."""
+        try:
+            self._fs.cc(ch, 101, 0)
+            self._fs.cc(ch, 100, 0)
+            self._fs.cc(ch, 6, _BEND_RANGE)
+            self._fs.cc(ch, 38, 0)
+            self._fs.cc(ch, 101, 127)
+            self._fs.cc(ch, 100, 127)
+        except Exception:
+            pass
 
     def load_soundfont(self, path: str) -> bool:
         ok = self._load_sf2(path)
@@ -147,7 +189,7 @@ class Player(QObject):
     def has_soundfont(self) -> bool:
         return self._sfid >= 0
 
-    # ----------------------------------------------------------------- mode
+    # ----------------------------------------------------------------- mode / preset
 
     def set_mode(self, mode: str):
         if mode == self._mode:
@@ -178,6 +220,7 @@ class Player(QObject):
             self._midi_ch[track_idx] = ch
             if self._fs and self._sfid >= 0:
                 self._fs.program_select(ch, self._sfid, 0, self._guitar_preset)
+                self._set_pb_range(ch)
         if _PG_AUDIO:
             self._cache_tones(events)
         self._tracks[track_idx] = events
@@ -262,7 +305,7 @@ class Player(QObject):
             self._wall_start = time.monotonic() * 1000.0
         self._speed = max(0.1, speed)
 
-    # ----------------------------------------------------------------- private
+    # ----------------------------------------------------------------- tick
 
     def _now(self) -> float:
         return self._offset_ms + (time.monotonic() * 1000.0 - self._wall_start) * self._speed
@@ -275,17 +318,20 @@ class Player(QObject):
         for track_idx, events in self._tracks.items():
             idx = self._event_idx.get(track_idx, len(events))
             while idx < len(events) and events[idx].time_ms <= now:
-                self._note_on(track_idx, events[idx])
+                self._note_on(track_idx, events[idx], now)
                 idx += 1
             self._event_idx[track_idx] = idx
 
-            done = [s for s, (_, off_ms, _p) in self._active[track_idx].items()
+            done = [s for s, (_, off_ms, _p, _t, _fx) in self._active[track_idx].items()
                     if now >= off_ms]
             for s in done:
-                _, _, pitch = self._active[track_idx].pop(s)
+                _, _, pitch, _, _ = self._active[track_idx].pop(s)
                 self._note_off(track_idx, s, pitch)
 
-            updates[track_idx] = {s: fret for s, (fret, _, _p) in self._active[track_idx].items()}
+            if self._mode == 'fluid':
+                self._apply_fluid_pitch_fx(track_idx, now)
+
+            updates[track_idx] = {s: fret for s, (fret, _, _p, _t, _fx) in self._active[track_idx].items()}
 
         self.notes_changed.emit(updates)
 
@@ -297,10 +343,15 @@ class Player(QObject):
             self.is_playing = False
             self.finished.emit()
 
-    def _note_on(self, track_idx: int, ev: NoteEvent):
+    # ----------------------------------------------------------------- note on/off
+
+    def _note_on(self, track_idx: int, ev: NoteEvent, now: float):
         if ev.string in self._active[track_idx]:
-            _, _, old_pitch = self._active[track_idx][ev.string]
+            _, _, old_pitch, _, _ = self._active[track_idx][ev.string]
             self._note_off(track_idx, ev.string, old_pitch)
+
+        fx = ev.effects
+        velocity = fx.velocity if fx else 100
 
         if self._mode == 'synth' and _PG_AUDIO:
             slot = self._pg_slot.get(track_idx)
@@ -308,13 +359,21 @@ class Player(QObject):
                 ch = pygame.mixer.Channel(slot * _STRINGS + (ev.string - 1))
                 if ch.get_busy():
                     ch.stop()
-                ch.play(self._tone_cache[ev.midi_pitch])
+                ch.play(self._tone_cache[ev.midi_pitch], maxtime=int(ev.duration_ms))
         elif self._mode == 'fluid' and self._fs and self._sfid >= 0:
             midi_ch = self._midi_ch.get(track_idx)
             if midi_ch is not None:
-                self._fs.noteon(midi_ch, ev.midi_pitch, 100)
+                # apply slide-in: start pitch offset resolves to 0 over the note
+                if fx and fx.slide_in:
+                    self._fs.pitch_bend(midi_ch, _semitones_to_pb(fx.slide_in))
+                elif fx and not fx.bend:
+                    self._fs.pitch_bend(midi_ch, 8192)
+                self._fs.noteon(midi_ch, ev.midi_pitch, velocity)
 
-        self._active[track_idx][ev.string] = (ev.fret, ev.time_ms + ev.duration_ms, ev.midi_pitch)
+        off_ms = ev.time_ms + ev.duration_ms
+        if fx and fx.let_ring:
+            off_ms = ev.time_ms + ev.duration_ms * 4.0
+        self._active[track_idx][ev.string] = (ev.fret, off_ms, ev.midi_pitch, now, fx)
 
     def _note_off(self, track_idx: int, string: int, pitch: int):
         if self._mode == 'synth' and _PG_AUDIO:
@@ -325,6 +384,53 @@ class Player(QObject):
             midi_ch = self._midi_ch.get(track_idx)
             if midi_ch is not None:
                 self._fs.noteoff(midi_ch, pitch)
+                # reset pitch bend if no more pitched notes on this channel
+                if not any(
+                    fx and (fx.bend or fx.vibrato or fx.slide_in or fx.slide_out)
+                    for (_, _, _, _, fx) in self._active[track_idx].values()
+                ):
+                    self._fs.pitch_bend(midi_ch, 8192)
+
+    def _apply_fluid_pitch_fx(self, track_idx: int, now: float):
+        """Compute and send pitch-bend for the track's channel each tick."""
+        ch = self._midi_ch.get(track_idx)
+        if ch is None or self._fs is None:
+            return
+
+        semitones = 0.0
+        has_fx = False
+
+        for _, off_ms, _, start_ms, fx in self._active[track_idx].values():
+            if fx is None:
+                continue
+            duration = off_ms - start_ms
+            t = (now - start_ms) / duration if duration > 0 else 1.0
+            t = max(0.0, min(1.0, t))
+
+            note_s = 0.0
+
+            if fx.bend:
+                note_s += _interp_bend(fx.bend, t)
+                has_fx = True
+
+            if fx.slide_in and t < 0.25:
+                note_s += fx.slide_in * (1.0 - t / 0.25)
+                has_fx = True
+
+            if fx.slide_out and t > 0.7:
+                note_s += fx.slide_out * ((t - 0.7) / 0.3)
+                has_fx = True
+
+            if fx.vibrato:
+                note_s += math.sin(2 * math.pi * _VIBRATO_HZ * now / 1000.0) * _VIBRATO_DEPTH
+                has_fx = True
+
+            semitones = note_s   # last active string with effects wins
+
+        if has_fx:
+            self._fs.pitch_bend(ch, _semitones_to_pb(semitones))
+
+    # ----------------------------------------------------------------- silence
 
     def _silence_track(self, track_idx: int):
         slot = self._pg_slot.get(track_idx)
@@ -333,9 +439,12 @@ class Player(QObject):
                 pygame.mixer.Channel(slot * _STRINGS + s).fadeout(80)
         midi_ch = self._midi_ch.get(track_idx)
         if self._fs and midi_ch is not None:
-            for _, _, pitch in self._active.get(track_idx, {}).values():
+            for _, _, pitch, _, _ in self._active.get(track_idx, {}).values():
                 self._fs.noteoff(midi_ch, pitch)
+            self._fs.pitch_bend(midi_ch, 8192)
         self._active[track_idx] = {}
+
+    # ----------------------------------------------------------------- helpers
 
     def _cache_tones(self, events: List[NoteEvent]):
         if _PG_AUDIO:

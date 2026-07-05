@@ -1,23 +1,40 @@
-from dataclasses import dataclass
-from typing import List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 import zipfile
 import guitarpro
+
+
+@dataclass
+class BendPoint:
+    pos: float     # 0.0–1.0 fraction of note duration
+    value: float   # pitch offset in semitones
+
+
+@dataclass
+class NoteEffects:
+    velocity: int = 100
+    duration_scale: float = 1.0
+    let_ring: bool = False
+    vibrato: bool = False
+    bend: List[BendPoint] = field(default_factory=list)
+    slide_in: float = 0.0    # starting pitch offset in semitones (e.g. -2.5 = from below)
+    slide_out: float = 0.0   # ending pitch offset in semitones
 
 
 @dataclass
 class NoteEvent:
     time_ms: float
     duration_ms: float
-    string: int       # 1-6, 1 = high e
-    fret: int         # 0 = open
+    string: int          # 1-6, 1 = high e
+    fret: int            # 0 = open
     midi_pitch: int
+    effects: Optional[NoteEffects] = None
 
 
 def load_song(path: str):
     try:
         return guitarpro.parse(path)
     except Exception as primary_err:
-        # Fall back to our own ZIP+GPIF parser for GP6 .gpx files
         try:
             from gpif_parser import load_gpx
             return load_gpx(path)
@@ -43,18 +60,14 @@ def parse_track(song, track_index: int) -> Tuple[List[NoteEvent], float]:
     num_strings = len(track.strings)
 
     for measure in track.measures:
-        # Pick up tempo changes stored on the measure (GP4/5/X)
         tempo, quarter_ms = _check_measure_tempo(measure, tempo, quarter_ms)
-
         voice = measure.voices[0] if measure.voices else None
         if voice is None:
             continue
 
         beat_ms = current_ms
         for beat in voice.beats:
-            # Pick up mid-beat tempo changes (mix-table, common in GPX)
             tempo, quarter_ms = _check_beat_tempo(beat, tempo, quarter_ms)
-
             try:
                 dur_ms = _duration_ms(beat.duration, quarter_ms)
             except Exception:
@@ -69,12 +82,14 @@ def parse_track(song, track_index: int) -> Tuple[List[NoteEvent], float]:
                     midi = open_pitch + note.value
                     if not (0 <= midi <= 127):
                         continue
+                    fx = _parse_note_effects(note, beat)
                     events.append(NoteEvent(
                         time_ms=beat_ms,
-                        duration_ms=dur_ms * 0.85,
+                        duration_ms=dur_ms * 0.85 * fx.duration_scale,
                         string=s,
                         fret=note.value,
                         midi_pitch=midi,
+                        effects=fx,
                     ))
                 except Exception:
                     continue
@@ -84,6 +99,72 @@ def parse_track(song, track_index: int) -> Tuple[List[NoteEvent], float]:
 
     events.sort(key=lambda e: e.time_ms)
     return events, tempo
+
+
+def _parse_note_effects(note, beat) -> NoteEffects:
+    ne = note.effect
+    be = beat.effect
+
+    velocity = 100
+    duration_scale = 1.0
+
+    if getattr(ne, 'heavyAccentuatedNote', False) or getattr(ne, 'accentuatedNote', False):
+        velocity = 120
+    elif getattr(ne, 'hammer', False):
+        velocity = 55
+    if getattr(ne, 'palmMute', False):
+        velocity = min(velocity, 65)
+        duration_scale = 0.35
+    if getattr(ne, 'staccato', False):
+        duration_scale = min(duration_scale, 0.2)
+
+    let_ring = bool(getattr(ne, 'letRing', False))
+    vibrato = bool(getattr(ne, 'vibrato', False) or getattr(be, 'vibrato', False))
+
+    bend = _parse_bend(ne)
+    slide_in, slide_out = _parse_slides(ne)
+
+    return NoteEffects(
+        velocity=velocity,
+        duration_scale=duration_scale,
+        let_ring=let_ring,
+        vibrato=vibrato,
+        bend=bend,
+        slide_in=slide_in,
+        slide_out=slide_out,
+    )
+
+
+def _parse_bend(ne) -> List[BendPoint]:
+    try:
+        b = ne.bend
+        if not b or not b.points:
+            return []
+        return [BendPoint(p.position / 12.0, p.value / 100.0) for p in b.points]
+    except Exception:
+        return []
+
+
+def _parse_slides(ne) -> Tuple[float, float]:
+    slide_in = 0.0
+    slide_out = 0.0
+    try:
+        slides = ne.slides
+        if not slides:
+            return slide_in, slide_out
+        for s in slides:
+            name = s.name
+            if name == 'intoFromBelow':
+                slide_in = -2.5
+            elif name == 'intoFromAbove':
+                slide_in = 2.5
+            elif name == 'outDownwards':
+                slide_out = -2.5
+            elif name == 'outUpwards':
+                slide_out = 2.5
+    except Exception:
+        pass
+    return slide_in, slide_out
 
 
 def _check_measure_tempo(measure, tempo, quarter_ms):
