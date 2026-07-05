@@ -35,7 +35,7 @@ def _make_tone(freq: float) -> "pygame.mixer.Sound":
     peak = np.abs(wave).max()
     if peak:
         wave /= peak
-    return pygame.mixer.Sound(buffer=(wave * 32767).astype(np.int16).tobytes())
+    return pygame.mixer.Sound(buffer=(wave * 8000).astype(np.int16).tobytes())
 
 
 def _midi_freq(pitch: int) -> float:
@@ -100,6 +100,7 @@ class Player(QObject):
         self._wall_start = 0.0
 
         self.pitch_offset: int = 0
+        self._muted: set = set()
 
         self._tracks: Dict[int, List[NoteEvent]] = {}
         self._event_idx: Dict[int, int] = {}
@@ -148,7 +149,15 @@ class Player(QObject):
         self._active.clear()
         self._pg_slot.clear()
         self._free_pg = list(range(_MAX_PG_TRACKS))
+        self._muted.clear()
         self.total_ms = 0.0
+
+    def mute_track(self, track_idx: int, muted: bool):
+        if muted:
+            self._muted.add(track_idx)
+            self._silence_track(track_idx)
+        else:
+            self._muted.discard(track_idx)
 
     # ----------------------------------------------------------------- playback
 
@@ -249,7 +258,7 @@ class Player(QObject):
 
         fx = ev.effects
 
-        if _PG_AUDIO:
+        if _PG_AUDIO and track_idx not in self._muted:
             pitch = max(0, min(127, ev.midi_pitch + self.pitch_offset))
             if pitch not in self._tone_cache:
                 self._tone_cache[pitch] = _make_tone(_midi_freq(pitch))

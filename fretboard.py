@@ -9,15 +9,21 @@
 # ]
 # ///
 
+import json
 import sys
+from pathlib import Path
 from typing import Dict, Tuple
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
+    QMenu, QCheckBox,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QSize
+
+_PREFS_PATH = Path.home() / ".fretboard.json"
+_MAX_RECENT = 5
 
 
 class _SeekSlider(QSlider):
@@ -63,9 +69,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Fretboard Viewer")
         self.setMinimumSize(960, 340)
         self._song = None
+        self._current_path: str | None = None
         self._player = Player()
         self._fretboards: Dict[int, Tuple[QWidget, FretboardWidget]] = {}
         self._track_events: Dict[int, Tuple[list, float]] = {}
+        self._track_rows: Dict[int, Tuple[QCheckBox, QPushButton]] = {}
+        self._load_prefs()
         self._build_ui()
         self._connect()
 
@@ -80,8 +89,14 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         self._open_btn = QPushButton("Open GP File…")
         top.addWidget(self._open_btn)
+        self._recent_btn = QPushButton("Recent ▾")
+        self._recent_btn.setFixedWidth(90)
+        self._recent_menu = QMenu(self)
+        self._recent_btn.setMenu(self._recent_menu)
+        top.addWidget(self._recent_btn)
         top.addStretch()
         outer.addLayout(top)
+        self._refresh_recent_menu()
 
         # ── middle: track panel + scroll area ────────────────────────────
         middle = QHBoxLayout()
@@ -168,7 +183,6 @@ class MainWindow(QMainWindow):
         self._stop_btn.clicked.connect(self._stop)
         self._pitch_down_btn.clicked.connect(lambda: self._shift_pitch(-1))
         self._pitch_up_btn.clicked.connect(lambda: self._shift_pitch(1))
-        self._track_list.itemChanged.connect(self._on_track_toggled)
         self._speed_slider.valueChanged.connect(self._on_speed)
         self._seek_slider.sliderPressed.connect(self._seek_pressed)
         self._seek_slider.sliderReleased.connect(self._seek_released)
@@ -186,6 +200,9 @@ class MainWindow(QMainWindow):
             )
         if not path:
             return
+
+        self._save_current_state()
+
         try:
             self._song = load_song(path)
         except Exception as exc:
@@ -198,16 +215,18 @@ class MainWindow(QMainWindow):
             frame.deleteLater()
         self._fretboards.clear()
         self._track_events.clear()
+        self._track_rows.clear()
 
-        self._track_list.blockSignals(True)
         self._track_list.clear()
         for i, t in enumerate(self._song.tracks):
-            item = QListWidgetItem(f"{i + 1}: {t.name}")
+            name = f"{i + 1}: {t.name}"
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            item.setToolTip(t.name)
             self._track_list.addItem(item)
-        self._track_list.blockSignals(False)
+            row, cb, mute_btn = self._make_track_row(i, name)
+            item.setSizeHint(QSize(0, 28))
+            self._track_list.setItemWidget(item, row)
+            self._track_rows[i] = (cb, mute_btn)
         self._track_list.setEnabled(True)
 
         self._play_btn.setEnabled(True)
@@ -216,18 +235,46 @@ class MainWindow(QMainWindow):
         self._seek_slider.setValue(0)
         self._play_btn.setText("Play")
 
-        # Auto-select first track
-        if self._track_list.count():
-            self._track_list.item(0).setCheckState(Qt.CheckState.Checked)
+        self._current_path = path
+        self._update_recent(path)
+
+        state = self._prefs.get("states", {}).get(path)
+        if state:
+            self._restore_state(state)
+        elif self._track_rows:
+            self._track_rows[0][0].setChecked(True)
 
     # ----------------------------------------------------------------- track management
 
-    def _on_track_toggled(self, item: QListWidgetItem):
-        track_idx = item.data(Qt.ItemDataRole.UserRole)
-        if item.checkState() == Qt.CheckState.Checked:
-            self._add_fretboard(track_idx, item.text())
+    def _make_track_row(self, idx: int, name: str):
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(2, 1, 2, 1)
+        h.setSpacing(4)
+        cb = QCheckBox()
+        cb.setChecked(False)
+        cb.toggled.connect(lambda checked, i=idx, n=name: self._on_track_checked(i, n, checked))
+        mute_btn = QPushButton("M")
+        mute_btn.setCheckable(True)
+        mute_btn.setFixedSize(22, 22)
+        mute_btn.setToolTip("Mute")
+        mute_btn.toggled.connect(lambda on, i=idx, btn=mute_btn: self._on_track_muted(i, on, btn))
+        lbl = QLabel(name)
+        lbl.setToolTip(name)
+        h.addWidget(cb)
+        h.addWidget(lbl, stretch=1)
+        h.addWidget(mute_btn)
+        return w, cb, mute_btn
+
+    def _on_track_checked(self, idx: int, name: str, checked: bool):
+        if checked:
+            self._add_fretboard(idx, name)
         else:
-            self._remove_fretboard(track_idx)
+            self._remove_fretboard(idx)
+
+    def _on_track_muted(self, idx: int, muted: bool, btn: QPushButton):
+        self._player.mute_track(idx, muted)
+        btn.setStyleSheet("background: #8b0000; color: white;" if muted else "")
 
     def _add_fretboard(self, track_idx: int, name: str):
         if track_idx in self._fretboards or self._song is None:
@@ -343,6 +390,89 @@ class MainWindow(QMainWindow):
         speed = value / 100.0
         self._speed_lbl.setText(f"{speed:.2f}×")
         self._player.set_speed(speed)
+
+    # ----------------------------------------------------------------- prefs / state
+
+    def _load_prefs(self):
+        try:
+            self._prefs = json.loads(_PREFS_PATH.read_text())
+        except Exception:
+            self._prefs = {"recent": [], "states": {}}
+
+    def _save_prefs(self):
+        try:
+            _PREFS_PATH.write_text(json.dumps(self._prefs, indent=2))
+        except Exception:
+            pass
+
+    def _save_current_state(self):
+        if self._current_path is None:
+            return
+        enabled = [i for i, (cb, _) in self._track_rows.items() if cb.isChecked()]
+        muted = [i for i, (_, btn) in self._track_rows.items() if btn.isChecked()]
+        pos = self._player._now() if self._player.is_playing else self._player._offset_ms
+        self._prefs.setdefault("states", {})[self._current_path] = {
+            "position_ms": pos,
+            "tracks": enabled,
+            "muted": muted,
+            "pitch": self._player.pitch_offset,
+            "speed": self._speed_slider.value(),
+        }
+
+    def _restore_state(self, state: dict):
+        pitch = state.get("pitch", 0)
+        self._player.set_pitch_offset(pitch)
+        self._pitch_lbl.setText(f"{pitch:+d} st" if pitch else "0 st")
+
+        self._speed_slider.setValue(state.get("speed", 100))
+
+        tracks = set(state.get("tracks", []))
+        muted = set(state.get("muted", []))
+        for idx, (cb, mute_btn) in self._track_rows.items():
+            if idx in tracks:
+                cb.setChecked(True)
+            if idx in muted:
+                mute_btn.setChecked(True)
+
+        if not tracks and self._track_rows:
+            first = min(self._track_rows)
+            self._track_rows[first][0].setChecked(True)
+
+        pos = state.get("position_ms", 0.0)
+        if pos > 0 and self._player.total_ms > 0:
+            self._player.seek(pos)
+            self._seek_slider.setValue(int(pos))
+            s = int(pos / 1000)
+            self._pos_lbl.setText(f"{s // 60}:{s % 60:02d}")
+
+    def _update_recent(self, path: str):
+        recents = self._prefs.setdefault("recent", [])
+        if path in recents:
+            recents.remove(path)
+        recents.insert(0, path)
+        self._prefs["recent"] = recents[:_MAX_RECENT]
+        self._refresh_recent_menu()
+
+    def _refresh_recent_menu(self):
+        self._recent_menu.clear()
+        recents = self._prefs.get("recent", [])
+        if not recents:
+            act = self._recent_menu.addAction("(none)")
+            act.setEnabled(False)
+            return
+        for path in recents:
+            p = Path(path)
+            act = self._recent_menu.addAction(p.name)
+            act.setToolTip(path)
+            if not p.exists():
+                act.setEnabled(False)
+            else:
+                act.triggered.connect(lambda checked, p=path: self._open_file(p))
+
+    def closeEvent(self, event):
+        self._save_current_state()
+        self._save_prefs()
+        super().closeEvent(event)
 
 
 def main():
