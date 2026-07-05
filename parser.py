@@ -146,7 +146,7 @@ def _parse_bend(ne) -> List[BendPoint]:
         b = ne.bend
         if not b or not b.points:
             return []
-        return [BendPoint(p.position / 12.0, p.value / 100.0) for p in b.points]
+        return [BendPoint(p.position / 12.0, p.value / 2.0) for p in b.points]
     except Exception:
         return []
 
