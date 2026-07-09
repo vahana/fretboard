@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Running the app
 
 ```bash
-./fretboard.py                   # open file picker on launch
+./fretboard.py                   # launches the app
 ./fretboard.py path/to/song.gp5  # open a specific file
 ```
 
@@ -52,6 +52,7 @@ The app is a Guitar Pro file viewer/player built with PyQt6.
    - Per-file state (position, enabled tracks, muted tracks, pitch, speed) persisted to `~/.fretboard.json`
    - Recent files menu (max 5)
    - Beat indicator widget (`_BeatIndicator`) flashes circles matching the time signature
+   - `_GProTabDialog` — search dialog for gprotab.net: `_SearchWorker` fetches search results + artist page, results shown as a grouped `QTreeWidget` (songs collapsed, versions as children), `_RatingWorker` fetches rating on single-click, `_DownloadWorker` downloads the selected tab
 
 ### GP6/GPX fallback
 
