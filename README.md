@@ -31,11 +31,53 @@ A Guitar Pro file player and fretboard visualiser built with PyQt6.
 - Recent files menu (last 5 opened)
 - Per-file state saved across sessions: playback position, enabled tracks, muted tracks, pitch offset, and speed
 
-## Running
+### GProTab search
 
-Requires [uv](https://github.com/astral-sh/uv). Dependencies are declared inline — no setup needed.
+Built-in search dialog connects to [gprotab.net](https://gprotab.net):
+
+- Search by artist or song name
+- Results grouped by song, multiple versions collapsed under one entry
+- Click a group to expand; click a tab to fetch its rating
+- Double-click or press **Download && Open** to download and play immediately
+
+## Installation
+
+### Prerequisites
+
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv) — fast Python package runner
+
+Install `uv` if you don't have it:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+On macOS with Homebrew:
+
+```bash
+brew install uv
+```
+
+### Get the app
+
+```bash
+git clone https://github.com/vahana/fretboard.git
+cd fretboard
+chmod +x fretboard.py
+```
+
+No virtualenv or `pip install` needed — `uv` resolves and caches dependencies automatically on first run.
+
+## Running
 
 ```bash
 ./fretboard.py                   # open file picker
-./fretboard.py path/to/song.gp5  # open directly
+./fretboard.py path/to/song.gp5  # open a specific file
 ```
+
+On macOS you can also double-click `fretboard.py` in Finder if your system associates `.py` files with `uv`.
+
+## Supported formats
+
+`.gp3`, `.gp4`, `.gp5`, `.gpx`, `.gp`
