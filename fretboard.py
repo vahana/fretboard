@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
-    QMenu, QCheckBox, QDialog, QLineEdit,
+    QMenu, QCheckBox, QDialog, QLineEdit, QTreeWidget, QTreeWidgetItem,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
@@ -68,31 +68,91 @@ def _slug_to_title(slug: str) -> str:
     return ' '.join(w.capitalize() for w in slug.replace('-', ' ').split())
 
 
+def _group_label(label: str) -> str:
+    if ' – ' in label:
+        artist, song = label.split(' – ', 1)
+        song = re.sub(r'\s+\d+$', '', song).strip()
+        return f"{artist} – {song}"
+    return re.sub(r'\s+\d+$', '', label).strip()
+
+
 class _SearchWorker(QThread):
-    results_ready = pyqtSignal(list)
+    results_ready = pyqtSignal(list, str)
     error = pyqtSignal(str)
 
-    def __init__(self, query: str):
+    def __init__(self, query: str, page: int = 1):
         super().__init__()
         self._query = query
+        self._page = page
 
     def run(self):
         try:
-            url = f"{_GPROTAB_BASE}/en/search/?q={urllib.parse.quote(self._query)}"
+            q = urllib.parse.quote(self._query)
+            if self._page == 1:
+                url = f"{_GPROTAB_BASE}/en/search/?q={q}"
+            else:
+                url = f"{_GPROTAB_BASE}/en/search/?q={q}&page={self._page}"
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 html_text = resp.read().decode('utf-8', errors='replace')
             parser = _TabLinkParser()
             parser.feed(html_text)
+            seen = {path for path, _ in parser.results}
             results = []
             for path, text in parser.results:
                 parts = [p for p in path.split('/') if p]
                 artist = _slug_to_title(parts[2])
                 song = text if text else _slug_to_title(parts[3])
                 results.append((path, f"{artist} – {song}"))
-            self.results_ready.emit(results)
+
+            if self._page == 1:
+                slug = self._query.lower().strip().replace(' ', '-')
+                try:
+                    artist_req = urllib.request.Request(
+                        f"{_GPROTAB_BASE}/en/tabs/{slug}",
+                        headers={'User-Agent': 'Mozilla/5.0'},
+                    )
+                    with urllib.request.urlopen(artist_req, timeout=10) as resp:
+                        artist_html = resp.read().decode('utf-8', errors='replace')
+                    artist_parser = _TabLinkParser()
+                    artist_parser.feed(artist_html)
+                    for path, text in artist_parser.results:
+                        if path in seen:
+                            continue
+                        seen.add(path)
+                        parts = [p for p in path.split('/') if p]
+                        song = text if text else _slug_to_title(parts[3])
+                        results.append((path, f"{_slug_to_title(slug)} – {song}"))
+                except Exception:
+                    pass
+
+            page_nums = [int(m) for m in re.findall(r'/en/search/[^"]*page=(\d+)', html_text)]
+            next_url = f"{_GPROTAB_BASE}/en/search/?q={q}&page={self._page + 1}" if any(p > self._page for p in page_nums) else ""
+            self.results_ready.emit(results, next_url)
         except Exception as exc:
             self.error.emit(str(exc))
+
+
+class _RatingWorker(QThread):
+    rating_ready = pyqtSignal(str)
+
+    def __init__(self, path: str):
+        super().__init__()
+        self._path = path
+
+    def run(self):
+        try:
+            url = f"{_GPROTAB_BASE}{self._path}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                text = resp.read().decode('utf-8', errors='replace')
+            m = re.search(r'(\d+(?:\.\d+)?)/5[^0-9\n]{0,40}?(\d+)\s+vote', text)
+            if m:
+                self.rating_ready.emit(f"{m.group(1)}/5 · {m.group(2)} votes")
+            else:
+                self.rating_ready.emit("no rating")
+        except Exception:
+            self.rating_ready.emit("")
 
 
 class _DownloadWorker(QThread):
@@ -133,7 +193,12 @@ class _GProTabDialog(QDialog):
         self.setMinimumHeight(420)
         self._prefs = prefs
         self._results = []
+        self._groups = {}
+        self._next_url = ""
+        self._query = ""
+        self._next_page = 1
         self._search_worker = None
+        self._rating_worker = None
         self._dl_worker = None
         self._downloaded_path = ''
         self._build()
@@ -149,8 +214,14 @@ class _GProTabDialog(QDialog):
         row.addWidget(self._search_btn)
         layout.addLayout(row)
 
-        self._list = QListWidget()
-        layout.addWidget(self._list, stretch=1)
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setRootIsDecorated(True)
+        layout.addWidget(self._tree, stretch=1)
+
+        self._load_more_btn = QPushButton("Load More")
+        self._load_more_btn.setVisible(False)
+        layout.addWidget(self._load_more_btn)
 
         self._status = QLabel("")
         layout.addWidget(self._status)
@@ -171,9 +242,11 @@ class _GProTabDialog(QDialog):
 
         self._search_btn.clicked.connect(self._do_search)
         self._search_edit.returnPressed.connect(self._do_search)
-        self._list.itemSelectionChanged.connect(self._on_selection)
-        self._list.itemDoubleClicked.connect(lambda _: self._do_download())
+        self._tree.itemSelectionChanged.connect(self._on_selection)
+        self._tree.itemClicked.connect(self._on_item_clicked)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._open_btn.clicked.connect(self._do_download)
+        self._load_more_btn.clicked.connect(self._do_load_more)
         self._dir_btn.clicked.connect(self._change_dir)
 
     def _download_dir_str(self) -> str:
@@ -189,40 +262,99 @@ class _GProTabDialog(QDialog):
         q = self._search_edit.text().strip()
         if not q:
             return
-        self._list.clear()
+        self._query = q
+        self._next_page = 1
+        self._tree.clear()
         self._results = []
+        self._groups = {}
+        self._load_more_btn.setVisible(False)
         self._open_btn.setEnabled(False)
         self._status.setText("Searching…")
         self._search_btn.setEnabled(False)
-        self._search_worker = _SearchWorker(q)
+        self._search_worker = _SearchWorker(q, 1)
         self._search_worker.results_ready.connect(self._on_results)
         self._search_worker.error.connect(self._on_error)
         self._search_worker.start()
 
-    def _on_results(self, results):
-        self._results = results
+    def _do_load_more(self):
+        self._load_more_btn.setEnabled(False)
+        self._status.setText("Loading…")
+        self._search_worker = _SearchWorker(self._query, self._next_page)
+        self._search_worker.results_ready.connect(self._on_results)
+        self._search_worker.error.connect(self._on_error)
+        self._search_worker.start()
+
+    def _on_results(self, results, next_url):
         self._search_btn.setEnabled(True)
-        self._list.clear()
-        if not results:
+        self._load_more_btn.setEnabled(True)
+        self._results.extend(results)
+
+        for path, label in results:
+            key = _group_label(label)
+            if key not in self._groups:
+                group = QTreeWidgetItem(self._tree)
+                group.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._groups[key] = group
+            group = self._groups[key]
+            child = QTreeWidgetItem(group)
+            child.setText(0, _slug_to_title(path.split('/')[-1]))
+            child.setData(0, Qt.ItemDataRole.UserRole, path)
+            count = group.childCount()
+            group.setText(0, f"{key}  ({count})" if count > 1 else key)
+
+        if not self._results:
             self._status.setText("No results.")
+            self._load_more_btn.setVisible(False)
             return
-        for _, label in results:
-            self._list.addItem(label)
-        self._status.setText(f"{len(results)} result(s)")
+        self._tree.sortItems(0, Qt.SortOrder.AscendingOrder)
+        self._status.setText(f"{len(self._results)} tab(s) across {len(self._groups)} song(s)")
+        if next_url:
+            self._next_page += 1
+            self._load_more_btn.setVisible(True)
+        else:
+            self._load_more_btn.setVisible(False)
 
     def _on_error(self, msg):
         self._search_btn.setEnabled(True)
-        self._open_btn.setEnabled(bool(self._list.selectedItems()))
+        self._open_btn.setEnabled(bool(self._tree.selectedItems()))
         self._status.setText(f"Error: {msg}")
 
     def _on_selection(self):
-        self._open_btn.setEnabled(bool(self._list.selectedItems()))
+        items = self._tree.selectedItems()
+        self._open_btn.setEnabled(bool(items) and items[0].parent() is not None)
+
+    def _on_item_clicked(self, item, column):
+        if item.parent() is None:
+            item.setExpanded(not item.isExpanded())
+            return
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        label = item.text(0)
+        self._status.setText(f"{label}  –  fetching rating…")
+        if self._rating_worker and self._rating_worker.isRunning():
+            self._rating_worker.terminate()
+        self._rating_worker = _RatingWorker(path)
+        self._rating_worker.rating_ready.connect(
+            lambda r, lbl=label: self._on_rating_ready(r, lbl)
+        )
+        self._rating_worker.start()
+
+    def _on_item_double_clicked(self, item, column):
+        if item.parent() is not None:
+            self._do_download()
+
+    def _on_rating_ready(self, rating: str, label: str):
+        if rating:
+            self._status.setText(f"{label}  –  {rating}")
+        else:
+            self._status.setText(label)
 
     def _do_download(self):
-        idx = self._list.currentRow()
-        if idx < 0:
+        items = self._tree.selectedItems()
+        if not items or items[0].parent() is None:
             return
-        path, label = self._results[idx]
+        item = items[0]
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        label = item.text(0)
         self._status.setText(f"Downloading {label}…")
         self._open_btn.setEnabled(False)
         self._dl_worker = _DownloadWorker(path, Path(self._download_dir_str()))
