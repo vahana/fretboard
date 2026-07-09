@@ -1,5 +1,7 @@
 # Fretboard Viewer
 
+![Fretboard Viewer screenshot](screenshot.png)
+
 A Guitar Pro file player and fretboard visualiser built with PyQt6.
 
 ## Features
