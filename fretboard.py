@@ -9,8 +9,13 @@
 # ]
 # ///
 
+import html.parser
 import json
+import re
 import sys
+import tempfile
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Dict, Tuple
 from PyQt6.QtWidgets import (
@@ -18,13 +23,219 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
-    QMenu, QCheckBox,
+    QMenu, QCheckBox, QDialog, QLineEdit,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QRectF
+from PyQt6.QtCore import Qt, QTimer, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
 
 _PREFS_PATH = Path.home() / ".fretboard.json"
 _MAX_RECENT = 5
+_GPROTAB_BASE = "https://gprotab.net"
+
+
+class _TabLinkParser(html.parser.HTMLParser):
+    """Extracts /en/tabs/artist/song links from a gprotab.net search page."""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._cur_href = None
+        self._cur_text = []
+        self._seen = set()
+
+    def handle_starttag(self, tag, attrs):
+        if tag != 'a':
+            return
+        href = dict(attrs).get('href', '')
+        parts = [p for p in href.split('/') if p]
+        if len(parts) == 4 and parts[0] == 'en' and parts[1] == 'tabs':
+            self._cur_href = href
+            self._cur_text = []
+
+    def handle_endtag(self, tag):
+        if tag == 'a' and self._cur_href is not None:
+            text = ''.join(self._cur_text).strip()
+            if self._cur_href not in self._seen:
+                self._seen.add(self._cur_href)
+                self.results.append((self._cur_href, text))
+            self._cur_href = None
+
+    def handle_data(self, data):
+        if self._cur_href is not None:
+            self._cur_text.append(data)
+
+
+def _slug_to_title(slug: str) -> str:
+    return ' '.join(w.capitalize() for w in slug.replace('-', ' ').split())
+
+
+class _SearchWorker(QThread):
+    results_ready = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, query: str):
+        super().__init__()
+        self._query = query
+
+    def run(self):
+        try:
+            url = f"{_GPROTAB_BASE}/en/search/?q={urllib.parse.quote(self._query)}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html_text = resp.read().decode('utf-8', errors='replace')
+            parser = _TabLinkParser()
+            parser.feed(html_text)
+            results = []
+            for path, text in parser.results:
+                parts = [p for p in path.split('/') if p]
+                artist = _slug_to_title(parts[2])
+                song = text if text else _slug_to_title(parts[3])
+                results.append((path, f"{artist} – {song}"))
+            self.results_ready.emit(results)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _DownloadWorker(QThread):
+    done = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, path: str, dest_dir: Path):
+        super().__init__()
+        self._path = path
+        self._dest_dir = dest_dir
+
+    def run(self):
+        try:
+            url = f"{_GPROTAB_BASE}{self._path}?download"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content_disp = resp.headers.get('Content-Disposition', '')
+                filename = None
+                m = re.search(r'filename=["\']?([^"\';\r\n]+)', content_disp)
+                if m:
+                    filename = m.group(1).strip()
+                if not filename:
+                    filename = self._path.split('/')[-1] + '.gp5'
+                data = resp.read()
+            self._dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = self._dest_dir / filename
+            dest.write_bytes(data)
+            self.done.emit(str(dest))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _GProTabDialog(QDialog):
+    def __init__(self, prefs: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Search GProTab")
+        self.setMinimumWidth(520)
+        self.setMinimumHeight(420)
+        self._prefs = prefs
+        self._results = []
+        self._search_worker = None
+        self._dl_worker = None
+        self._downloaded_path = ''
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Artist or song…")
+        self._search_btn = QPushButton("Search")
+        row.addWidget(self._search_edit)
+        row.addWidget(self._search_btn)
+        layout.addLayout(row)
+
+        self._list = QListWidget()
+        layout.addWidget(self._list, stretch=1)
+
+        self._status = QLabel("")
+        layout.addWidget(self._status)
+
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("Save to:"))
+        self._dir_lbl = QLabel(self._download_dir_str())
+        self._dir_lbl.setStyleSheet("color: #888;")
+        dir_row.addWidget(self._dir_lbl, stretch=1)
+        self._dir_btn = QPushButton("Change…")
+        self._dir_btn.setFixedWidth(70)
+        dir_row.addWidget(self._dir_btn)
+        layout.addLayout(dir_row)
+
+        self._open_btn = QPushButton("Download && Open")
+        self._open_btn.setEnabled(False)
+        layout.addWidget(self._open_btn)
+
+        self._search_btn.clicked.connect(self._do_search)
+        self._search_edit.returnPressed.connect(self._do_search)
+        self._list.itemSelectionChanged.connect(self._on_selection)
+        self._list.itemDoubleClicked.connect(lambda _: self._do_download())
+        self._open_btn.clicked.connect(self._do_download)
+        self._dir_btn.clicked.connect(self._change_dir)
+
+    def _download_dir_str(self) -> str:
+        return self._prefs.get("download_dir", str(Path.home() / "Downloads"))
+
+    def _change_dir(self):
+        chosen = QFileDialog.getExistingDirectory(self, "Select Download Folder", self._download_dir_str())
+        if chosen:
+            self._prefs["download_dir"] = chosen
+            self._dir_lbl.setText(chosen)
+
+    def _do_search(self):
+        q = self._search_edit.text().strip()
+        if not q:
+            return
+        self._list.clear()
+        self._results = []
+        self._open_btn.setEnabled(False)
+        self._status.setText("Searching…")
+        self._search_btn.setEnabled(False)
+        self._search_worker = _SearchWorker(q)
+        self._search_worker.results_ready.connect(self._on_results)
+        self._search_worker.error.connect(self._on_error)
+        self._search_worker.start()
+
+    def _on_results(self, results):
+        self._results = results
+        self._search_btn.setEnabled(True)
+        self._list.clear()
+        if not results:
+            self._status.setText("No results.")
+            return
+        for _, label in results:
+            self._list.addItem(label)
+        self._status.setText(f"{len(results)} result(s)")
+
+    def _on_error(self, msg):
+        self._search_btn.setEnabled(True)
+        self._open_btn.setEnabled(bool(self._list.selectedItems()))
+        self._status.setText(f"Error: {msg}")
+
+    def _on_selection(self):
+        self._open_btn.setEnabled(bool(self._list.selectedItems()))
+
+    def _do_download(self):
+        idx = self._list.currentRow()
+        if idx < 0:
+            return
+        path, label = self._results[idx]
+        self._status.setText(f"Downloading {label}…")
+        self._open_btn.setEnabled(False)
+        self._dl_worker = _DownloadWorker(path, Path(self._download_dir_str()))
+        self._dl_worker.done.connect(self._on_downloaded)
+        self._dl_worker.error.connect(self._on_error)
+        self._dl_worker.start()
+
+    def _on_downloaded(self, file_path: str):
+        self._downloaded_path = file_path
+        self.accept()
+
+    def selected_file(self) -> str:
+        return self._downloaded_path
 
 
 class _SeekSlider(QSlider):
@@ -146,6 +357,8 @@ class MainWindow(QMainWindow):
         self._recent_menu = QMenu(self)
         self._recent_btn.setMenu(self._recent_menu)
         top.addWidget(self._recent_btn)
+        self._gprotab_btn = QPushButton("Search GProTab…")
+        top.addWidget(self._gprotab_btn)
         top.addStretch()
         outer.addLayout(top)
         self._refresh_recent_menu()
@@ -239,6 +452,7 @@ class MainWindow(QMainWindow):
 
     def _connect(self):
         self._open_btn.clicked.connect(self._open_file)
+        self._gprotab_btn.clicked.connect(self._open_gprotab)
         self._play_btn.clicked.connect(self._toggle_play)
         self._stop_btn.clicked.connect(self._stop)
         self._pitch_down_btn.clicked.connect(lambda: self._shift_pitch(-1))
@@ -253,6 +467,16 @@ class MainWindow(QMainWindow):
         self._player.beat_changed.connect(self._beat_indicator.set_beat)
 
     # ----------------------------------------------------------------- file
+
+    def _open_gprotab(self):
+        dlg = _GProTabDialog(self._prefs, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._save_prefs()
+            path = dlg.selected_file()
+            if path:
+                self._open_file(path)
+        else:
+            self._save_prefs()
 
     def _open_file(self, path: str = ''):
         if not path:
