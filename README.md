@@ -72,8 +72,8 @@ No virtualenv or `pip install` needed — `uv` resolves and caches dependencies 
 ## Running
 
 ```bash
-./fretboard.py                   # open file picker
-./fretboard.py path/to/song.gp5  # open a specific file
+./fretboard.py                   # opens a file chooser dialog
+./fretboard.py path/to/song.gp5  # open a specific file directly
 ```
 
 On macOS you can also double-click `fretboard.py` in Finder if your system associates `.py` files with `uv`.
