@@ -35,12 +35,14 @@ The app is a Guitar Pro file viewer/player built with PyQt6.
    - `load_song(path)` → PyGuitarPro song object (falls back to `gpif_parser` for GP6)
    - `parse_track(song, idx)` → `(List[NoteEvent], tempo_bpm)`
    - `parse_beats(song)` → `List[BeatEvent]`
+   - `parse_sections(song)` → `List[Tuple[float, str]]` — section markers (Intro, Chorus, Solo, etc.) with timestamps
 
 2. **`player.py`** — `Player(QObject)` drives playback via a 16ms QTimer tick:
    - Loads tracks as `List[NoteEvent]`; emits `notes_changed(dict)`, `position_changed(float)`, `finished()`
    - Synthesizes audio with pygame mixer: static tones cached by MIDI pitch (`_make_tone`), per-note waveforms for bend/slide/vibrato (`_make_fx_tone` via phase accumulation), a pitch-independent thud for dead notes (`_make_dead_tone`), and click tones for metronome
    - `notes_changed` payload: `{track_idx: {string: (fret, NoteEffects, bend_offset_semitones)}}`
    - Supports: pitch offset (semitones), speed multiplier, per-track mute, seek, metronome on/off
+   - Loop: `set_loop(start_ms, end_ms)` / `clear_loop()` — enforced in `_tick` before any note processing
 
 3. **`fretboard_widget.py`** — `FretboardWidget(QWidget)` paints one fretboard per track:
    - `set_notes(dict)` — currently sounding notes (from `notes_changed`)
@@ -49,10 +51,13 @@ The app is a Guitar Pro file viewer/player built with PyQt6.
    - Context notes: amber (past), green (upcoming), grey x (dead), brown (palm mute); alpha scales with `dist_frac`
 
 4. **`fretboard.py`** — `MainWindow(QMainWindow)` ties everything together:
-   - Per-file state (position, enabled tracks, muted tracks, pitch, speed) persisted to `~/.fretboard.json`
+   - Per-file state (position, enabled tracks, muted tracks, pitch, speed, loop markers) persisted to `~/.fretboard.json`
+   - Reopens last used file on startup
    - Recent files menu (max 5)
    - Beat indicator widget (`_BeatIndicator`) flashes circles matching the time signature
+   - `_LoopBar` — custom widget below the seek slider: colored segments between bar-snapped markers, section dots, beat/bar grid ticks, red playhead; supports click-to-seek, double-click to add/remove markers, drag to reposition
    - `_GProTabDialog` — search dialog for gprotab.net: `_SearchWorker` fetches search results + artist page, results shown as a grouped `QTreeWidget` (songs collapsed, versions as children), `_RatingWorker` fetches rating on single-click, `_DownloadWorker` downloads the selected tab
+   - Keyboard shortcuts (all use `ApplicationShortcut` so they fire regardless of focus): Space, L, M, D, ←→ (bar), ↑↓ (segment), ⌘←→ (move/create marker)
 
 ### GP6/GPX fallback
 
