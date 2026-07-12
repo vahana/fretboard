@@ -405,7 +405,7 @@ class _SeekSlider(QSlider):
 
 from fretboard_widget import FretboardWidget
 from player import Player
-from parser import load_song, parse_track, parse_beats
+from parser import load_song, parse_track, parse_beats, parse_sections
 
 
 class _LoopBar(QWidget):
@@ -424,6 +424,7 @@ class _LoopBar(QWidget):
         self._loop_active = False
         self._beat_times: list = []
         self._bar_times: list = []
+        self._sections: list = []  # [(time_ms, title), ...]
         self._seg_colors = [
             (QColor(35, 70, 110), QColor(60, 110, 170)),
             (QColor(70, 40, 100), QColor(110, 70, 155)),
@@ -434,6 +435,10 @@ class _LoopBar(QWidget):
 
     def set_loop_active(self, on: bool):
         self._loop_active = on
+        self.update()
+
+    def set_sections(self, sections: list):
+        self._sections = sections
         self.update()
 
     def set_beats(self, beat_times: list, bar_times: list):
@@ -544,7 +549,12 @@ class _LoopBar(QWidget):
         if self._bar_times and self._total_ms > 0:
             ms = self._x_to_ms(event.position().x())
             bar = self._bar_num_at(ms)
-            QToolTip.showText(event.globalPosition().toPoint(), f"Bar {bar}", self)
+            section = next(
+                (title for t, title in reversed(self._sections) if t <= ms),
+                None,
+            )
+            tip = f"Bar {bar}  –  {section}" if section else f"Bar {bar}"
+            QToolTip.showText(event.globalPosition().toPoint(), tip, self)
         if self._drag_idx >= 0 and event.buttons() & Qt.MouseButton.LeftButton:
             i = self._drag_idx
             lo = self._markers[i - 1] if i > 0 else 0.0
@@ -617,6 +627,14 @@ class _LoopBar(QWidget):
         for m in self._markers:
             x = int(self._ms_to_x(m))
             p.drawLine(x, 0, x, h)
+
+        # section dots
+        if self._sections:
+            for t, _title in self._sections:
+                x = int(self._ms_to_x(t))
+                p.setPen(QPen(QColor(0, 0, 0, 160), 1))
+                p.setBrush(QBrush(QColor(255, 215, 60)))
+                p.drawEllipse(x - 4, h // 2 - 4, 8, 8)
 
         ph_x = int(self._ms_to_x(self._playhead_ms))
         p.setPen(QPen(QColor(255, 60, 60), 1))
@@ -708,6 +726,9 @@ class MainWindow(QMainWindow):
         self._gprotab_btn = QPushButton("Search GProTab…")
         top.addWidget(self._gprotab_btn)
         top.addStretch()
+        self._help_btn = QPushButton("?")
+        self._help_btn.setFixedWidth(28)
+        top.addWidget(self._help_btn)
         outer.addLayout(top)
         self._refresh_recent_menu()
 
@@ -759,6 +780,9 @@ class MainWindow(QMainWindow):
         self._stop_btn = QPushButton("Stop")
         self._pos_lbl = QLabel("0:00")
         self._pos_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._bar_lbl = QLabel("")
+        self._bar_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._bar_lbl.setStyleSheet("color: #888;")
         self._play_btn.setEnabled(False)
         self._stop_btn.setEnabled(False)
         self._play_btn.setFixedWidth(80)
@@ -799,6 +823,8 @@ class MainWindow(QMainWindow):
         ctrl.addSpacing(8)
         ctrl.addWidget(self._loop_btn)
         ctrl.addStretch()
+        ctrl.addWidget(self._bar_lbl)
+        ctrl.addStretch()
         ctrl.addWidget(QLabel("Pitch:"))
         ctrl.addWidget(self._pitch_down_btn)
         ctrl.addWidget(self._pitch_lbl)
@@ -812,6 +838,7 @@ class MainWindow(QMainWindow):
     def _connect(self):
         self._open_btn.clicked.connect(self._open_file)
         self._gprotab_btn.clicked.connect(self._open_gprotab)
+        self._help_btn.clicked.connect(self._show_help)
         self._play_btn.clicked.connect(self._toggle_play)
         self._stop_btn.clicked.connect(self._stop)
         self._pitch_down_btn.clicked.connect(lambda: self._shift_pitch(-1))
@@ -828,10 +855,76 @@ class MainWindow(QMainWindow):
         self._player.position_changed.connect(self._on_position)
         self._player.finished.connect(self._on_finished)
         self._player.beat_changed.connect(self._beat_indicator.set_beat)
-        QShortcut(QKeySequence("M"), self).activated.connect(self._add_marker_at_current)
-        QShortcut(QKeySequence("L"), self).activated.connect(self._loop_btn.toggle)
+        for key, slot in [
+            ("Space", self._toggle_play),
+            ("M", self._metro_btn.toggle),
+            ("L", self._loop_btn.toggle),
+            ("Left", lambda: self._seek_by_bar(-1)),
+            ("Right", lambda: self._seek_by_bar(1)),
+            ("Ctrl+Left", lambda: self._cmd_marker_bar(-1)),
+            ("Ctrl+Right", lambda: self._cmd_marker_bar(1)),
+            ("D", self._delete_marker_at_current),
+            ("Up", lambda: self._seek_to_segment(1)),
+            ("Down", lambda: self._seek_to_segment(-1)),
+        ]:
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            sc.activated.connect(slot)
 
     # ----------------------------------------------------------------- file
+
+    def _show_help(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard Shortcuts")
+        dlg.setMinimumWidth(380)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(0)
+
+        sections = [
+            ("Playback", [
+                ("Space", "Play / Pause"),
+                ("M", "Toggle metronome"),
+            ]),
+            ("Navigation", [
+                ("← →", "Move one bar back / forward"),
+                ("↑ ↓", "Next / previous segment"),
+            ]),
+            ("Loop segments", [
+                ("L", "Toggle loop on selected segment"),
+                ("⌘ ← →", "Move marker at playhead one bar, or create one"),
+                ("D", "Delete marker at playhead"),
+                ("Double-click bar", "Add marker at that bar"),
+                ("Double-click marker", "Remove that marker"),
+            ]),
+        ]
+
+        for title, rows in sections:
+            header = QLabel(title)
+            header.setStyleSheet("font-weight: bold; padding: 10px 0 4px 0;")
+            layout.addWidget(header)
+            for key, desc in rows:
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 2, 0, 2)
+                key_lbl = QLabel(key)
+                key_lbl.setFixedWidth(110)
+                key_lbl.setStyleSheet(
+                    "font-family: monospace; background: #2a2a2a; color: #ddd;"
+                    "border-radius: 3px; padding: 2px 6px;"
+                )
+                desc_lbl = QLabel(desc)
+                row.addWidget(key_lbl)
+                row.addSpacing(10)
+                row.addWidget(desc_lbl)
+                row.addStretch()
+                w = QWidget()
+                w.setLayout(row)
+                layout.addWidget(w)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addSpacing(12)
+        layout.addWidget(close_btn)
+        dlg.exec()
 
     def _open_gprotab(self):
         dlg = _GProTabDialog(self._prefs, self)
@@ -867,6 +960,7 @@ class MainWindow(QMainWindow):
         self._loop_bar.set_active_segment(-1)
         self._loop_bar.set_total(0.0)
         self._loop_bar.set_beats([], [])
+        self._loop_bar.set_sections([])
         for frame, _ in self._fretboards.values():
             self._fb_layout.removeWidget(frame)
             frame.deleteLater()
@@ -899,6 +993,7 @@ class MainWindow(QMainWindow):
             [b.time_ms for b in _beats],
             [b.time_ms for b in _beats if b.beat_num == 1],
         )
+        self._loop_bar.set_sections(parse_sections(self._song))
         self._beat_indicator.reset()
         self._current_path = path
         self._update_recent(path)
@@ -1025,6 +1120,14 @@ class MainWindow(QMainWindow):
     def _on_position(self, ms: float):
         s = int(ms / 1000)
         self._pos_lbl.setText(f"{s // 60}:{s % 60:02d}")
+        bar = self._loop_bar._bar_num_at(ms)
+        section = next(
+            (title for t, title in reversed(self._loop_bar._sections) if t <= ms),
+            None,
+        )
+        self._bar_lbl.setText(
+            f"{section}  –  bar {bar}" if section else (f"bar {bar}" if bar else "")
+        )
         self._loop_bar.set_playhead(ms)
         if not self._dragging:
             self._seek_slider.blockSignals(True)
@@ -1073,6 +1176,86 @@ class MainWindow(QMainWindow):
             self._player.set_loop(*bounds)
         else:
             self._player.clear_loop()
+
+    def _delete_marker_at_current(self):
+        bars = self._loop_bar._bar_times
+        if not bars or self._player.total_ms <= 0:
+            return
+        now = self._player._now() if self._player.is_playing else self._player._offset_ms
+        snapped = self._loop_bar._snap(now)
+        markers = list(self._loop_bar._markers)
+        if snapped not in markers:
+            return
+        markers.remove(snapped)
+        n_segs = len(markers) + 1
+        if self._loop_bar._active_segment >= n_segs:
+            self._loop_bar.set_active_segment(n_segs - 1)
+        self._loop_bar.set_markers(markers)
+        if self._loop_btn.isChecked():
+            self._apply_loop()
+
+    def _cmd_marker_bar(self, delta: int):
+        bars = self._loop_bar._bar_times
+        if not bars or self._player.total_ms <= 0:
+            return
+        now = self._player._now() if self._player.is_playing else self._player._offset_ms
+        snapped = self._loop_bar._snap(now)
+        markers = list(self._loop_bar._markers)
+
+        if snapped in markers:
+            i = markers.index(snapped)
+            lo = markers[i - 1] if i > 0 else 0.0
+            hi = markers[i + 1] if i < len(markers) - 1 else self._player.total_ms
+            valid = [t for t in bars if lo < t < hi and t != snapped]
+            candidates = [t for t in valid if t > snapped] if delta > 0 else [t for t in valid if t < snapped]
+            if not candidates:
+                return
+            new_ms = candidates[0] if delta > 0 else candidates[-1]
+            markers[i] = new_ms
+            markers.sort()
+            self._loop_bar.set_markers(markers)
+            self._player.seek(new_ms)
+        else:
+            if snapped == 0.0 or snapped in markers or snapped >= self._player.total_ms:
+                return
+            markers.append(snapped)
+            markers.sort()
+            self._loop_bar.set_markers(markers)
+            self._player.seek(snapped)
+
+        if self._loop_btn.isChecked():
+            self._apply_loop()
+
+    def _seek_to_segment(self, delta: int):
+        n_segs = len(self._loop_bar._markers) + 1
+        if n_segs < 2:
+            return
+        cur = self._loop_bar._active_segment
+        if cur < 0:
+            now = self._player._now() if self._player.is_playing else self._player._offset_ms
+            cur = self._loop_bar._segment_at_x(self._loop_bar._ms_to_x(now))
+        idx = max(0, min(n_segs - 1, cur + delta))
+        if idx == cur:
+            return
+        self._loop_bar.set_active_segment(idx)
+        bounds = self._loop_bar.get_segment_bounds(idx)
+        if bounds:
+            self._player.seek(bounds[0])
+        if self._loop_btn.isChecked():
+            self._apply_loop()
+
+    def _seek_by_bar(self, delta: int):
+        bars = self._loop_bar._bar_times
+        if not bars or self._player.total_ms <= 0:
+            return
+        now = self._player._now() if self._player.is_playing else self._player._offset_ms
+        if delta > 0:
+            targets = [t for t in bars if t > now + 50]
+            ms = targets[0] if targets else self._player.total_ms
+        else:
+            targets = [t for t in bars if t < now - 50]
+            ms = targets[-1] if targets else 0.0
+        self._player.seek(ms)
 
     def _add_marker_at_current(self):
         if self._player.total_ms <= 0:

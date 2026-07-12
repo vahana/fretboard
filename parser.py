@@ -85,6 +85,32 @@ def parse_beats(song) -> List[BeatEvent]:
     return events
 
 
+def parse_sections(song) -> List[Tuple[float, str]]:
+    try:
+        track = song.tracks[0]
+    except (IndexError, AttributeError):
+        return []
+    tempo = song.tempo if getattr(song, 'tempo', None) and song.tempo > 0 else 120
+    quarter_ms = 60_000.0 / tempo
+    sections = []
+    current_ms = 0.0
+    for measure in track.measures:
+        tempo, quarter_ms = _check_measure_tempo(measure, tempo, quarter_ms)
+        marker = getattr(measure, 'marker', None)
+        if marker:
+            title = getattr(marker, 'title', '').strip()
+            if title:
+                sections.append((current_ms, title))
+        try:
+            ts = measure.timeSignature
+            bpb = ts.numerator
+            denom = ts.denominator.value
+        except Exception:
+            bpb, denom = 4, 4
+        current_ms += bpb * quarter_ms * (4.0 / denom)
+    return sections
+
+
 def parse_track(song, track_index: int) -> Tuple[List[NoteEvent], float]:
     from gpif_parser import _GpifSong, parse_gpif_track
     if isinstance(song, _GpifSong):
