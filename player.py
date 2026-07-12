@@ -197,6 +197,9 @@ class Player(QObject):
             self._click_lo = _make_click(900)
             self._click_ch = pygame.mixer.Channel(_MAX_PG_TRACKS * _STRINGS)
 
+        self._loop_start_ms: Optional[float] = None
+        self._loop_end_ms: Optional[float] = None
+
         self._timer = QTimer(self)
         self._timer.setInterval(TICK_MS)
         self._timer.timeout.connect(self._tick)
@@ -294,11 +297,20 @@ class Player(QObject):
         self._offset_ms = ms
         self._wall_start = time.monotonic() * 1000.0
         self.notes_changed.emit({idx: {} for idx in self._tracks})
+        self.position_changed.emit(ms)
         if was_playing:
             self._timer.start()
 
     def set_pitch_offset(self, semitones: int):
         self.pitch_offset = max(-24, min(24, semitones))
+
+    def set_loop(self, start_ms: float, end_ms: float):
+        self._loop_start_ms = start_ms
+        self._loop_end_ms = end_ms
+
+    def clear_loop(self):
+        self._loop_start_ms = None
+        self._loop_end_ms = None
 
     def set_speed(self, speed: float):
         if self.is_playing:
@@ -313,6 +325,9 @@ class Player(QObject):
 
     def _tick(self):
         now = self._now()
+        if self._loop_end_ms is not None and now >= self._loop_end_ms:
+            self.seek(self._loop_start_ms)
+            return
         self.position_changed.emit(now)
         updates: Dict[int, Dict] = {}
 
