@@ -1041,9 +1041,9 @@ class MainWindow(QMainWindow):
 
     def _on_track_checked(self, idx: int, name: str, checked: bool):
         if checked:
-            self._add_fretboard(idx, name)
+            self._load_track(idx, name)
         else:
-            self._remove_fretboard(idx)
+            self._unload_track(idx)
 
     def _on_track_muted(self, idx: int, muted: bool, btn: QPushButton):
         self._player.mute_track(idx, muted)
@@ -1051,9 +1051,17 @@ class MainWindow(QMainWindow):
 
     def _on_track_instrument_changed(self, idx: int, instrument: str):
         self._player.set_track_instrument(idx, instrument)
+        if self._track_rows[idx][0].isChecked():
+            if instrument == "Drums":
+                self._hide_fretboard(idx)
+            elif idx not in self._fretboards and self._song:
+                name = f"{idx + 1}: {self._song.tracks[idx].name}"
+                self._show_fretboard(idx, name)
 
-    def _add_fretboard(self, track_idx: int, name: str):
-        if track_idx in self._fretboards or self._song is None:
+    # ----------------------------------------------------------------- audio
+
+    def _load_track(self, track_idx: int, name: str):
+        if self._song is None:
             return
         try:
             events, tempo = parse_track(self._song, track_idx)
@@ -1063,44 +1071,49 @@ class MainWindow(QMainWindow):
             self._track_list.item(track_idx).setCheckState(Qt.CheckState.Unchecked)
             self._track_list.blockSignals(False)
             return
+        instrument = self._track_rows[track_idx][2].currentData() if track_idx in self._track_rows else "Guitar"
+        self._track_events[track_idx] = (events, tempo)
+        self._player.load_track(track_idx, events)
+        self._player.set_track_instrument(track_idx, instrument)
+        self._seek_slider.setRange(0, int(self._player.total_ms))
+        self._loop_bar.set_total(self._player.total_ms)
+        if instrument != "Drums":
+            self._show_fretboard(track_idx, name)
 
+    def _unload_track(self, track_idx: int):
+        self._hide_fretboard(track_idx)
+        self._track_events.pop(track_idx, None)
+        self._player.remove_track(track_idx)
+        self._seek_slider.setRange(0, int(self._player.total_ms))
+        self._loop_bar.set_total(self._player.total_ms)
+
+    # ----------------------------------------------------------------- fretboard widget
+
+    def _show_fretboard(self, track_idx: int, name: str):
+        if track_idx in self._fretboards:
+            return
         frame = QFrame()
         frame.setFrameShape(QFrame.Shape.StyledPanel)
         vbox = QVBoxLayout(frame)
         vbox.setSpacing(2)
         vbox.setContentsMargins(6, 4, 6, 6)
-
         lbl = QLabel(name)
         lbl.setStyleSheet("font-weight: bold; color: #c8a870; padding: 2px 0;")
         vbox.addWidget(lbl)
-
         fb = FretboardWidget()
         fb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         vbox.addWidget(fb)
-
         insert_pos = sum(1 for idx in self._fretboards if idx < track_idx)
         self._fb_layout.insertWidget(insert_pos, frame)
         self._fretboards[track_idx] = (frame, fb)
-
-        self._track_events[track_idx] = (events, tempo)
-        self._player.load_track(track_idx, events)
-        if track_idx in self._track_rows:
-            instrument = self._track_rows[track_idx][2].currentData()
-            self._player.set_track_instrument(track_idx, instrument)
-        self._seek_slider.setRange(0, int(self._player.total_ms))
-        self._loop_bar.set_total(self._player.total_ms)
         QTimer.singleShot(0, self._resize_to_fit)
 
-    def _remove_fretboard(self, track_idx: int):
+    def _hide_fretboard(self, track_idx: int):
         if track_idx not in self._fretboards:
             return
         frame, _ = self._fretboards.pop(track_idx)
         self._fb_layout.removeWidget(frame)
         frame.deleteLater()
-        self._track_events.pop(track_idx, None)
-        self._player.remove_track(track_idx)
-        self._seek_slider.setRange(0, int(self._player.total_ms))
-        self._loop_bar.set_total(self._player.total_ms)
         QTimer.singleShot(0, self._resize_to_fit)
 
     def _resize_to_fit(self):
