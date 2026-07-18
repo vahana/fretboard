@@ -31,7 +31,7 @@ from PyQt6.QtCore import Qt, QTimer, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QShortcut, QKeySequence
 
 _PREFS_PATH = Path.home() / ".fretboard.json"
-_MAX_RECENT = 5
+_MAX_RECENT = 10
 _GPROTAB_BASE = "https://gprotab.net"
 
 
@@ -693,6 +693,57 @@ class _BeatIndicator(QWidget):
             p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
 
 
+class _TrackSettingsDialog(QDialog):
+    INSTRUMENTS = ["Clean", "Overdrive", "Distortion", "Bass", "Drums"]
+
+    def __init__(self, parent, track_idx: int, config: dict, on_change):
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setWindowTitle("")
+        self._on_change = on_change
+        self._track_idx = track_idx
+        self._config = config
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+
+        layout.addWidget(QLabel("Instrument"))
+        self._btns: Dict[str, QPushButton] = {}
+        btn_grid = QHBoxLayout()
+        for instr in self.INSTRUMENTS:
+            btn = QPushButton(instr)
+            btn.setCheckable(True)
+            btn.setChecked(config.get("instrument", "Clean") == instr)
+            btn.clicked.connect(lambda _, i=instr: self._select_instrument(i))
+            self._btns[instr] = btn
+            btn_grid.addWidget(btn)
+        layout.addLayout(btn_grid)
+
+        layout.addWidget(QLabel("Volume"))
+        vol_row = QHBoxLayout()
+        vol_slider = QSlider(Qt.Orientation.Horizontal)
+        vol_slider.setRange(0, 100)
+        vol = int(config.get("volume", 0.5) * 100)
+        vol_slider.setValue(vol)
+        self._vol_lbl = QLabel(f"{vol}%")
+        self._vol_lbl.setFixedWidth(36)
+        vol_slider.valueChanged.connect(self._on_volume)
+        vol_row.addWidget(vol_slider)
+        vol_row.addWidget(self._vol_lbl)
+        layout.addLayout(vol_row)
+
+    def _select_instrument(self, instrument: str):
+        for name, btn in self._btns.items():
+            btn.setChecked(name == instrument)
+        self._config["instrument"] = instrument
+        self._on_change(self._track_idx, self._config)
+
+    def _on_volume(self, value: int):
+        self._vol_lbl.setText(f"{value}%")
+        self._config["volume"] = value / 100.0
+        self._on_change(self._track_idx, self._config)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -703,10 +754,12 @@ class MainWindow(QMainWindow):
         self._player = Player()
         self._fretboards: Dict[int, Tuple[QWidget, FretboardWidget]] = {}
         self._track_events: Dict[int, Tuple[list, float]] = {}
-        self._track_rows: Dict[int, Tuple[QCheckBox, QPushButton, QComboBox]] = {}
+        self._track_rows: Dict[int, Tuple[QCheckBox, QPushButton, QPushButton]] = {}
+        self._track_configs: Dict[int, dict] = {}
         self._load_prefs()
         self._build_ui()
         self._connect()
+        self._apply_global_prefs()
 
     def _build_ui(self):
         root = QWidget()
@@ -838,6 +891,16 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(QLabel("Speed:"))
         ctrl.addWidget(self._speed_slider)
         ctrl.addWidget(self._speed_lbl)
+        ctrl.addSpacing(12)
+        ctrl.addWidget(QLabel("Vol:"))
+        self._master_vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self._master_vol_slider.setRange(0, 100)
+        self._master_vol_slider.setValue(100)
+        self._master_vol_slider.setFixedWidth(100)
+        self._master_vol_lbl = QLabel("100%")
+        self._master_vol_lbl.setFixedWidth(36)
+        ctrl.addWidget(self._master_vol_slider)
+        ctrl.addWidget(self._master_vol_lbl)
         outer.addLayout(ctrl)
 
     def _connect(self):
@@ -849,6 +912,7 @@ class MainWindow(QMainWindow):
         self._pitch_down_btn.clicked.connect(lambda: self._shift_pitch(-1))
         self._pitch_up_btn.clicked.connect(lambda: self._shift_pitch(1))
         self._speed_slider.valueChanged.connect(self._on_speed)
+        self._master_vol_slider.valueChanged.connect(self._on_master_volume)
         self._seek_slider.sliderPressed.connect(self._seek_pressed)
         self._seek_slider.sliderReleased.connect(self._seek_released)
         self._metro_btn.toggled.connect(self._on_metro_toggled)
@@ -972,6 +1036,7 @@ class MainWindow(QMainWindow):
         self._fretboards.clear()
         self._track_events.clear()
         self._track_rows.clear()
+        self._track_configs.clear()
 
         self._track_list.clear()
         for i, t in enumerate(self._song.tracks):
@@ -979,10 +1044,11 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)
             self._track_list.addItem(item)
-            row, cb, mute_btn, instr_combo = self._make_track_row(i, name)
+            row, cb, mute_btn, cog_btn = self._make_track_row(i, name)
             item.setSizeHint(QSize(0, 28))
             self._track_list.setItemWidget(item, row)
-            self._track_rows[i] = (cb, mute_btn, instr_combo)
+            self._track_rows[i] = (cb, mute_btn, cog_btn)
+            self._track_configs.setdefault(i, {"instrument": "Clean", "volume": 0.5})
         self._track_list.setEnabled(True)
 
         self._play_btn.setEnabled(True)
@@ -1029,22 +1095,15 @@ class MainWindow(QMainWindow):
         mute_btn.toggled.connect(lambda on, i=idx, btn=mute_btn: self._on_track_muted(i, on, btn))
         lbl = QLabel(name)
         lbl.setToolTip(name)
-        instr_combo = QComboBox()
-        instr_combo.addItem("🎸 Clean",      "Clean")
-        instr_combo.addItem("🎸 Overdrive",  "Overdrive")
-        instr_combo.addItem("🎸 Distortion", "Distortion")
-        instr_combo.addItem("🥁 Drums",      "Drums")
-        instr_combo.addItem("𝄢 Bass",        "Bass")
-        instr_combo.setFixedWidth(115)
-        instr_combo.setToolTip("Instrument")
-        instr_combo.currentIndexChanged.connect(
-            lambda _, i=idx, c=instr_combo: self._on_track_instrument_changed(i, c.currentData())
-        )
+        cog_btn = QPushButton("⚙")
+        cog_btn.setFixedSize(22, 22)
+        cog_btn.setToolTip("Track settings")
+        cog_btn.clicked.connect(lambda _, i=idx, b=cog_btn: self._open_track_settings(i, b))
         h.addWidget(cb)
         h.addWidget(lbl, stretch=1)
-        h.addWidget(instr_combo)
+        h.addWidget(cog_btn)
         h.addWidget(mute_btn)
-        return w, cb, mute_btn, instr_combo
+        return w, cb, mute_btn, cog_btn
 
     def _on_track_checked(self, idx: int, name: str, checked: bool):
         if checked:
@@ -1056,8 +1115,19 @@ class MainWindow(QMainWindow):
         self._player.mute_track(idx, muted)
         btn.setStyleSheet("background: #8b0000; color: white;" if muted else "")
 
-    def _on_track_instrument_changed(self, idx: int, instrument: str):
+    def _open_track_settings(self, idx: int, cog_btn: QPushButton):
+        config = self._track_configs.setdefault(idx, {"instrument": "Clean", "volume": 1.0})
+        dlg = _TrackSettingsDialog(self, idx, config, self._on_track_config_changed)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        pos = cog_btn.mapToGlobal(cog_btn.rect().bottomLeft())
+        dlg.move(pos)
+        dlg.show()
+
+    def _on_track_config_changed(self, idx: int, config: dict):
+        instrument = config.get("instrument", "Clean")
+        volume = config.get("volume", 1.0)
         self._player.set_track_instrument(idx, instrument)
+        self._player.set_track_volume(idx, volume)
         if self._track_rows[idx][0].isChecked():
             if instrument == "Drums":
                 self._hide_fretboard(idx)
@@ -1078,7 +1148,7 @@ class MainWindow(QMainWindow):
             self._track_list.item(track_idx).setCheckState(Qt.CheckState.Unchecked)
             self._track_list.blockSignals(False)
             return
-        instrument = self._track_rows[track_idx][2].currentData() if track_idx in self._track_rows else "Clean"
+        instrument = self._track_configs.get(track_idx, {}).get("instrument", "Clean")
         self._track_events[track_idx] = (events, tempo)
         self._player.load_track(track_idx, events)
         self._player.set_track_instrument(track_idx, instrument)
@@ -1329,6 +1399,12 @@ class MainWindow(QMainWindow):
         self._speed_lbl.setText(f"{speed:.2f}×")
         self._player.set_speed(speed)
 
+    def _on_master_volume(self, value: int):
+        self._master_vol_lbl.setText(f"{value}%")
+        self._player.master_volume = value / 100.0
+        self._prefs["master_volume"] = value
+        self._save_prefs()
+
     # ----------------------------------------------------------------- prefs / state
 
     def _load_prefs(self):
@@ -1336,6 +1412,12 @@ class MainWindow(QMainWindow):
             self._prefs = json.loads(_PREFS_PATH.read_text())
         except Exception:
             self._prefs = {"recent": [], "states": {}}
+
+    def _apply_global_prefs(self):
+        vol = self._prefs.get("master_volume", 100)
+        self._master_vol_slider.setValue(vol)
+        self._master_vol_lbl.setText(f"{vol}%")
+        self._player.master_volume = vol / 100.0
 
     def _save_prefs(self):
         try:
@@ -1348,7 +1430,6 @@ class MainWindow(QMainWindow):
             return
         enabled = [i for i, (cb, _, _c) in self._track_rows.items() if cb.isChecked()]
         muted = [i for i, (_c, btn, _i) in self._track_rows.items() if btn.isChecked()]
-        instruments = {i: combo.currentData() for i, (_c, _b, combo) in self._track_rows.items()}
         pos = self._player._now() if self._player.is_playing else self._player._offset_ms
         self._prefs.setdefault("states", {})[self._current_path] = {
             "position_ms": pos,
@@ -1359,7 +1440,7 @@ class MainWindow(QMainWindow):
             "markers": list(self._loop_bar._markers),
             "active_segment": self._loop_bar._active_segment,
             "loop_enabled": self._loop_btn.isChecked(),
-            "instruments": instruments,
+            "track_configs": {str(i): cfg for i, cfg in self._track_configs.items()},
         }
 
     def _restore_state(self, state: dict):
@@ -1371,19 +1452,28 @@ class MainWindow(QMainWindow):
 
         tracks = set(state.get("tracks", []))
         muted = set(state.get("muted", []))
-        instruments = state.get("instruments", {})
-        for idx, (cb, mute_btn, instr_combo) in self._track_rows.items():
+        saved_configs = state.get("track_configs", {})
+
+        # backward-compat: old state used "instruments" key with plain strings
+        if not saved_configs and "instruments" in state:
+            _old_map = {"Guitar": "Clean", "Bass": "Bass", "Drums": "Drums"}
+            for k, v in state["instruments"].items():
+                saved_configs[str(k)] = {"instrument": _old_map.get(v, "Clean"), "volume": 0.5}
+
+        # restore configs before enabling tracks so _load_track sees correct instrument
+        for idx in self._track_rows:
+            cfg = saved_configs.get(str(idx)) or saved_configs.get(idx)
+            if cfg:
+                self._track_configs[idx] = cfg
+
+        for idx, (cb, mute_btn, _cog) in self._track_rows.items():
             if idx in tracks:
                 cb.setChecked(True)
             if idx in muted:
                 mute_btn.setChecked(True)
-            saved_instr = instruments.get(str(idx)) or instruments.get(idx)
-            if saved_instr:
-                i = instr_combo.findData(saved_instr)
-                if i < 0:
-                    i = instr_combo.findText(saved_instr)
-                if i >= 0:
-                    instr_combo.setCurrentIndex(i)
+            cfg = self._track_configs.get(idx, {})
+            self._player.set_track_instrument(idx, cfg.get("instrument", "Clean"))
+            self._player.set_track_volume(idx, cfg.get("volume", 0.5))
 
         if not tracks and self._track_rows:
             first = min(self._track_rows)

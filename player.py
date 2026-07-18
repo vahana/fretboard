@@ -62,6 +62,8 @@ class Player(QObject):
         self.pitch_offset: int = 0
         self._muted: set = set()
         self._track_instruments: Dict[int, str] = {}
+        self._track_volume: Dict[int, float] = {}
+        self.master_volume: float = 1.0
         self._drum_cache: Dict[int, "pygame.mixer.Sound"] = {}
         self._instr_cache: Dict[Tuple[str, int], "pygame.mixer.Sound"] = {}
 
@@ -124,6 +126,7 @@ class Player(QObject):
         self._free_pg = list(range(_MAX_PG_TRACKS))
         self._muted.clear()
         self._track_instruments.clear()
+        self._track_volume.clear()
         self._drum_cache.clear()
         self._instr_cache.clear()
         self.total_ms = 0.0
@@ -139,6 +142,9 @@ class Player(QObject):
         self._track_instruments[track_idx] = instrument
         if PG_AUDIO and track_idx in self._tracks:
             self._cache_tones(track_idx)
+
+    def set_track_volume(self, track_idx: int, volume: float):
+        self._track_volume[track_idx] = max(0.0, min(1.0, volume))
 
     def load_metronome(self, events: List[BeatEvent]):
         self._metro_events = events
@@ -305,7 +311,7 @@ class Player(QObject):
             if slot is not None and sound is not None:
                 ch = pygame.mixer.Channel(slot * _STRINGS + (ev.string - 1))
                 ch.stop()
-                ch.set_volume(1.0)
+                ch.set_volume(self._track_volume.get(track_idx, 0.5) * self.master_volume)
                 ch.play(sound, maxtime=int(ev.duration_ms))
 
         off_ms = ev.time_ms + ev.duration_ms
