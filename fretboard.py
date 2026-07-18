@@ -6,6 +6,7 @@
 #   "PyQt6>=6.6.0",
 #   "pygame>=2.5.0",
 #   "numpy>=1.26.0",
+#   "pyfluidsynth>=1.3.3",
 # ]
 # ///
 
@@ -24,7 +25,7 @@ from PyQt6.QtWidgets import (
     QLabel, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
     QMenu, QCheckBox, QComboBox, QDialog, QLineEdit, QTreeWidget, QTreeWidgetItem,
-    QToolTip,
+    QToolTip, QSplitter,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QShortcut, QKeySequence
@@ -733,12 +734,12 @@ class MainWindow(QMainWindow):
         self._refresh_recent_menu()
 
         # ── middle: track panel + scroll area ────────────────────────────
-        middle = QHBoxLayout()
-        middle.setSpacing(8)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
 
         # Left: track checkbox list
         track_panel = QWidget()
-        track_panel.setFixedWidth(190)
+        track_panel.setMinimumWidth(150)
         tp_layout = QVBoxLayout(track_panel)
         tp_layout.setContentsMargins(0, 0, 0, 0)
         tp_layout.setSpacing(4)
@@ -747,7 +748,7 @@ class MainWindow(QMainWindow):
         self._track_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
         self._track_list.setEnabled(False)
         tp_layout.addWidget(self._track_list)
-        middle.addWidget(track_panel)
+        splitter.addWidget(track_panel)
 
         # Right: scrollable stacked fretboards
         self._fb_scroll = QScrollArea()
@@ -758,9 +759,13 @@ class MainWindow(QMainWindow):
         self._fb_layout.setSpacing(6)
         self._fb_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._fb_scroll.setWidget(self._fb_container)
-        middle.addWidget(self._fb_scroll, stretch=1)
+        splitter.addWidget(self._fb_scroll)
 
-        outer.addLayout(middle, stretch=1)
+        splitter.setSizes([190, 800])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        outer.addWidget(splitter, stretch=1)
 
         # ── seek slider ──────────────────────────────────────────────────
         self._seek_slider = _SeekSlider(Qt.Orientation.Horizontal)
@@ -1025,10 +1030,12 @@ class MainWindow(QMainWindow):
         lbl = QLabel(name)
         lbl.setToolTip(name)
         instr_combo = QComboBox()
-        instr_combo.addItem("🎸", "Guitar")
-        instr_combo.addItem("🥁", "Drums")
-        instr_combo.addItem("𝄢", "Bass")
-        instr_combo.setFixedWidth(40)
+        instr_combo.addItem("🎸 Clean",      "Clean")
+        instr_combo.addItem("🎸 Overdrive",  "Overdrive")
+        instr_combo.addItem("🎸 Distortion", "Distortion")
+        instr_combo.addItem("🥁 Drums",      "Drums")
+        instr_combo.addItem("𝄢 Bass",        "Bass")
+        instr_combo.setFixedWidth(115)
         instr_combo.setToolTip("Instrument")
         instr_combo.currentIndexChanged.connect(
             lambda _, i=idx, c=instr_combo: self._on_track_instrument_changed(i, c.currentData())
@@ -1071,7 +1078,7 @@ class MainWindow(QMainWindow):
             self._track_list.item(track_idx).setCheckState(Qt.CheckState.Unchecked)
             self._track_list.blockSignals(False)
             return
-        instrument = self._track_rows[track_idx][2].currentData() if track_idx in self._track_rows else "Guitar"
+        instrument = self._track_rows[track_idx][2].currentData() if track_idx in self._track_rows else "Clean"
         self._track_events[track_idx] = (events, tempo)
         self._player.load_track(track_idx, events)
         self._player.set_track_instrument(track_idx, instrument)

@@ -6,9 +6,12 @@ from parser import NoteEvent, NoteEffects, BeatEvent
 
 import synth
 from synth import (
-    PG_AUDIO, midi_freq, interp_bend,
+    PG_AUDIO, FS_AUDIO, midi_freq, interp_bend,
     make_tone, make_fx_tone, make_dead_tone,
     make_drum_tone, make_bass_tone, make_click,
+    make_fluidsynth_tone, make_fluidsynth_fx_tone,
+    PATCH_GUITAR_MUTED, PATCH_BASS,
+    GUITAR_INSTRUMENT_PATCH,
     VIBRATO_HZ, VIBRATO_DEPTH,
 )
 
@@ -58,10 +61,9 @@ class Player(QObject):
 
         self.pitch_offset: int = 0
         self._muted: set = set()
-        self._drum_tracks: set = set()
+        self._track_instruments: Dict[int, str] = {}
         self._drum_cache: Dict[int, "pygame.mixer.Sound"] = {}
-        self._bass_tracks: set = set()
-        self._bass_cache: Dict[int, "pygame.mixer.Sound"] = {}
+        self._instr_cache: Dict[Tuple[str, int], "pygame.mixer.Sound"] = {}
 
         self._tracks: Dict[int, List[NoteEvent]] = {}
         self._event_idx: Dict[int, int] = {}
@@ -69,7 +71,6 @@ class Player(QObject):
 
         self._pg_slot: Dict[int, int] = {}
         self._free_pg: List[int] = list(range(_MAX_PG_TRACKS))
-        self._tone_cache: Dict[int, "pygame.mixer.Sound"] = {}
         self._dead_tone: "pygame.mixer.Sound | None" = None
         self._metro_events: List[BeatEvent] = []
         self._metro_idx: int = 0
@@ -94,9 +95,9 @@ class Player(QObject):
         self._silence_track(track_idx)
         if track_idx not in self._pg_slot and self._free_pg:
             self._pg_slot[track_idx] = self._free_pg.pop(0)
-        if PG_AUDIO:
-            self._cache_tones(events)
         self._tracks[track_idx] = events
+        if PG_AUDIO:
+            self._cache_tones(track_idx)
         now = self._now() if self.is_playing else self._offset_ms
         self._event_idx[track_idx] = _find_idx(events, now)
         self._active[track_idx] = {}
@@ -122,8 +123,9 @@ class Player(QObject):
         self._pg_slot.clear()
         self._free_pg = list(range(_MAX_PG_TRACKS))
         self._muted.clear()
-        self._drum_tracks.clear()
-        self._bass_tracks.clear()
+        self._track_instruments.clear()
+        self._drum_cache.clear()
+        self._instr_cache.clear()
         self.total_ms = 0.0
 
     def mute_track(self, track_idx: int, muted: bool):
@@ -134,15 +136,9 @@ class Player(QObject):
             self._muted.discard(track_idx)
 
     def set_track_instrument(self, track_idx: int, instrument: str):
-        if instrument == "Drums":
-            self._drum_tracks.add(track_idx)
-            self._bass_tracks.discard(track_idx)
-        elif instrument == "Bass":
-            self._bass_tracks.add(track_idx)
-            self._drum_tracks.discard(track_idx)
-        else:
-            self._drum_tracks.discard(track_idx)
-            self._bass_tracks.discard(track_idx)
+        self._track_instruments[track_idx] = instrument
+        if PG_AUDIO and track_idx in self._tracks:
+            self._cache_tones(track_idx)
 
     def load_metronome(self, events: List[BeatEvent]):
         self._metro_events = events
@@ -275,36 +271,38 @@ class Player(QObject):
             self._note_off(track_idx, ev.string, old_pitch)
 
         fx = ev.effects
+        instrument = self._track_instruments.get(track_idx, "Clean")
 
         if PG_AUDIO and track_idx not in self._muted:
             is_dead = fx and fx.dead
             if is_dead:
                 sound = self._dead_tone
-            elif track_idx in self._drum_tracks:
+            elif instrument == "Drums":
                 drum_pitch = ev.midi_pitch
                 if drum_pitch not in self._drum_cache:
                     self._drum_cache[drum_pitch] = make_drum_tone(drum_pitch)
                 sound = self._drum_cache[drum_pitch]
-            elif track_idx in self._bass_tracks:
-                pitch = max(0, min(127, ev.midi_pitch + self.pitch_offset))
-                has_pitch_fx = fx and (fx.bend or fx.slide_in or fx.slide_out or fx.vibrato)
-                if has_pitch_fx:
-                    sound = make_fx_tone(pitch, ev.duration_ms, fx)
-                else:
-                    if pitch not in self._bass_cache:
-                        self._bass_cache[pitch] = make_bass_tone(midi_freq(pitch))
-                    sound = self._bass_cache[pitch]
             else:
                 pitch = max(0, min(127, ev.midi_pitch + self.pitch_offset))
+                is_bass = instrument == "Bass"
+                if is_bass:
+                    patch = PATCH_BASS
+                elif fx and fx.palm_mute:
+                    patch = PATCH_GUITAR_MUTED
+                else:
+                    patch = GUITAR_INSTRUMENT_PATCH.get(instrument, GUITAR_INSTRUMENT_PATCH["Clean"])
+                cache_key = (patch, pitch)
                 has_pitch_fx = fx and (fx.bend or fx.slide_in or fx.slide_out or fx.vibrato)
                 if has_pitch_fx:
-                    sound = make_fx_tone(pitch, ev.duration_ms, fx)
+                    sound = make_fluidsynth_fx_tone(patch, pitch, ev.duration_ms, fx)
+                    if sound is None:
+                        sound = make_fx_tone(pitch, ev.duration_ms, fx)
                 else:
-                    if pitch not in self._tone_cache:
-                        self._tone_cache[pitch] = make_tone(midi_freq(pitch))
-                    sound = self._tone_cache[pitch]
+                    if cache_key not in self._instr_cache:
+                        self._instr_cache[cache_key] = self._make_static_tone(instrument, patch, pitch)
+                    sound = self._instr_cache[cache_key]
             slot = self._pg_slot.get(track_idx)
-            if slot is not None:
+            if slot is not None and sound is not None:
                 ch = pygame.mixer.Channel(slot * _STRINGS + (ev.string - 1))
                 ch.stop()
                 ch.set_volume(1.0)
@@ -332,11 +330,30 @@ class Player(QObject):
 
     # ----------------------------------------------------------------- helpers
 
-    def _cache_tones(self, events: List[NoteEvent]):
-        if PG_AUDIO:
-            for pitch in {e.midi_pitch for e in events}:
-                if pitch not in self._tone_cache:
-                    self._tone_cache[pitch] = make_tone(midi_freq(pitch))
+    def _make_static_tone(self, instrument: str, patch: int, pitch: int) -> "pygame.mixer.Sound":
+        s = make_fluidsynth_tone(patch, pitch)
+        if s is not None:
+            return s
+        if instrument == "Bass":
+            return make_bass_tone(midi_freq(pitch))
+        return make_tone(midi_freq(pitch))
+
+    def _cache_tones(self, track_idx: int):
+        instrument = self._track_instruments.get(track_idx, "Clean")
+        if instrument == "Drums":
+            return
+        is_bass = instrument == "Bass"
+        base_patch = PATCH_BASS if is_bass else GUITAR_INSTRUMENT_PATCH.get(instrument, GUITAR_INSTRUMENT_PATCH["Clean"])
+        events = self._tracks.get(track_idx, [])
+        patches = set()
+        for e in events:
+            fx = e.effects
+            patch = PATCH_BASS if is_bass else (PATCH_GUITAR_MUTED if (fx and fx.palm_mute) else base_patch)
+            patches.add((patch, e.midi_pitch))
+        for patch, pitch in patches:
+            cache_key = (patch, pitch)
+            if cache_key not in self._instr_cache:
+                self._instr_cache[cache_key] = self._make_static_tone(instrument, patch, pitch)
 
     def _refresh_total(self):
         self.total_ms = max(

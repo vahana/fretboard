@@ -1,3 +1,4 @@
+import os
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -219,3 +220,127 @@ def make_click(freq: float, duration: float = 0.022) -> "pygame.mixer.Sound":
     if peak:
         wave /= peak
     return pygame.mixer.Sound(buffer=(wave * int(AMP * 1.4)).astype(np.int16).tobytes())
+
+
+# ── FluidSynth sampler ────────────────────────────────────────────────────────
+
+PATCH_GUITAR_CLEAN      = 25  # GM 26: Acoustic Guitar (steel)
+PATCH_GUITAR_MUTED      = 28  # GM 29: Electric Guitar (muted) — palm mute
+PATCH_GUITAR_OVERDRIVE  = 29  # GM 30: Overdriven Guitar
+PATCH_GUITAR_DISTORTION = 30  # GM 31: Distortion Guitar
+PATCH_BASS              = 33  # GM 34: Electric Bass (finger)
+
+GUITAR_INSTRUMENT_PATCH = {
+    "Clean":      PATCH_GUITAR_CLEAN,
+    "Overdrive":  PATCH_GUITAR_OVERDRIVE,
+    "Distortion": PATCH_GUITAR_DISTORTION,
+}
+
+_SF2_PATHS = [
+    os.path.expanduser("~/.fretboard/GeneralUser_GS.sf2"),
+    "/tmp/GeneralUser_GS.sf2",
+]
+
+_FS_SYNTH = None
+_FS_SFID = None
+FS_AUDIO = False
+
+try:
+    import fluidsynth as _fluidsynth
+    _FS_AVAILABLE = True
+except ImportError:
+    _FS_AVAILABLE = False
+
+
+def _get_fs():
+    global _FS_SYNTH, _FS_SFID, FS_AUDIO
+    if _FS_SYNTH is not None:
+        return _FS_SYNTH, _FS_SFID
+    if not _FS_AVAILABLE:
+        return None, None
+    sf2 = next((p for p in _SF2_PATHS if os.path.exists(p)), None)
+    if sf2 is None:
+        return None, None
+    try:
+        fs = _fluidsynth.Synth(gain=0.5, samplerate=float(SAMPLE_RATE))
+        sfid = fs.sfload(sf2)
+        if sfid == -1:
+            return None, None
+        for ch in range(16):
+            fs.cc(ch, 101, 0)
+            fs.cc(ch, 100, 0)
+            fs.cc(ch, 6, 12)
+            fs.cc(ch, 38, 0)
+        _FS_SYNTH = fs
+        _FS_SFID = sfid
+        FS_AUDIO = True
+        return fs, sfid
+    except Exception:
+        return None, None
+
+
+def _fs_to_mono(chunks) -> "np.ndarray":
+    raw = np.concatenate(chunks).reshape(-1, 2).astype(np.int32)
+    return ((raw[:, 0] + raw[:, 1]) // 2).astype(np.int16)
+
+
+def _fs_normalized(mono: "np.ndarray") -> "pygame.mixer.Sound":
+    peak = np.abs(mono).max()
+    if peak:
+        mono = (mono.astype(np.float32) / peak * AMP).astype(np.int16)
+    return pygame.mixer.Sound(buffer=mono.tobytes())
+
+
+def make_fluidsynth_tone(patch: int, pitch: int, duration_s: float = TONE_SECS) -> "pygame.mixer.Sound | None":
+    fs, sfid = _get_fs()
+    if fs is None or not PG_AUDIO:
+        return None
+    n = int(SAMPLE_RATE * duration_s)
+    fs.program_select(0, sfid, 0, patch)
+    fs.get_samples(512)  # drain residual
+    fs.noteon(0, pitch, 100)
+    mono = _fs_to_mono([np.array(fs.get_samples(n), dtype=np.int32)])
+    fs.noteoff(0, pitch)
+    fs.get_samples(int(SAMPLE_RATE * 0.1))  # drain release tail
+    return _fs_normalized(mono)
+
+
+def make_fluidsynth_fx_tone(patch: int, base_pitch: int, duration_ms: float, fx: "NoteEffects") -> "pygame.mixer.Sound | None":
+    fs, sfid = _get_fs()
+    if fs is None or not PG_AUDIO:
+        return None
+    duration_s = min(duration_ms / 1000.0, TONE_SECS)
+    n = int(SAMPLE_RATE * duration_s)
+    t = np.linspace(0, duration_s, n, endpoint=False)
+    t_norm = t / duration_s
+
+    semitones = np.zeros(n)
+    if fx.bend:
+        semitones += _interp_bend_vec(fx.bend, t_norm)
+    if fx.slide_in:
+        mask = t_norm < 0.25
+        semitones[mask] += fx.slide_in * (1.0 - t_norm[mask] / 0.25)
+    if fx.slide_out:
+        mask = t_norm > 0.7
+        semitones[mask] += fx.slide_out * ((t_norm[mask] - 0.7) / 0.3)
+    if fx.vibrato:
+        semitones += np.sin(2 * np.pi * VIBRATO_HZ * t) * VIBRATO_DEPTH
+
+    CHUNK = int(SAMPLE_RATE * 0.05)  # 50ms chunks
+    BEND_RANGE = 12
+
+    fs.program_select(0, sfid, 0, patch)
+    fs.get_samples(512)
+    fs.noteon(0, base_pitch, 100)
+    chunks = []
+    for i in range(0, n, CHUNK):
+        end = min(i + CHUNK, n)
+        semi = float(semitones[(i + end) // 2])
+        bend = max(0, min(16383, int(8192 + (semi / BEND_RANGE) * 8191)))
+        fs.pitch_bend(0, bend)
+        chunks.append(np.array(fs.get_samples(end - i), dtype=np.int32))
+    fs.noteoff(0, base_pitch)
+    fs.pitch_bend(0, 8192)
+    fs.get_samples(int(SAMPLE_RATE * 0.05))
+
+    return _fs_normalized(_fs_to_mono(chunks))
