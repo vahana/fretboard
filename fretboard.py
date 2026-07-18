@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
-    QMenu, QCheckBox, QDialog, QLineEdit, QTreeWidget, QTreeWidgetItem,
+    QMenu, QCheckBox, QComboBox, QDialog, QLineEdit, QTreeWidget, QTreeWidgetItem,
     QToolTip,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QRectF, QThread, pyqtSignal
@@ -702,7 +702,7 @@ class MainWindow(QMainWindow):
         self._player = Player()
         self._fretboards: Dict[int, Tuple[QWidget, FretboardWidget]] = {}
         self._track_events: Dict[int, Tuple[list, float]] = {}
-        self._track_rows: Dict[int, Tuple[QCheckBox, QPushButton]] = {}
+        self._track_rows: Dict[int, Tuple[QCheckBox, QPushButton, QComboBox]] = {}
         self._load_prefs()
         self._build_ui()
         self._connect()
@@ -974,10 +974,10 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, i)
             self._track_list.addItem(item)
-            row, cb, mute_btn = self._make_track_row(i, name)
+            row, cb, mute_btn, instr_combo = self._make_track_row(i, name)
             item.setSizeHint(QSize(0, 28))
             self._track_list.setItemWidget(item, row)
-            self._track_rows[i] = (cb, mute_btn)
+            self._track_rows[i] = (cb, mute_btn, instr_combo)
         self._track_list.setEnabled(True)
 
         self._play_btn.setEnabled(True)
@@ -1024,10 +1024,20 @@ class MainWindow(QMainWindow):
         mute_btn.toggled.connect(lambda on, i=idx, btn=mute_btn: self._on_track_muted(i, on, btn))
         lbl = QLabel(name)
         lbl.setToolTip(name)
+        instr_combo = QComboBox()
+        instr_combo.addItem("🎸", "Guitar")
+        instr_combo.addItem("🥁", "Drums")
+        instr_combo.addItem("𝄢", "Bass")
+        instr_combo.setFixedWidth(40)
+        instr_combo.setToolTip("Instrument")
+        instr_combo.currentIndexChanged.connect(
+            lambda _, i=idx, c=instr_combo: self._on_track_instrument_changed(i, c.currentData())
+        )
         h.addWidget(cb)
         h.addWidget(lbl, stretch=1)
+        h.addWidget(instr_combo)
         h.addWidget(mute_btn)
-        return w, cb, mute_btn
+        return w, cb, mute_btn, instr_combo
 
     def _on_track_checked(self, idx: int, name: str, checked: bool):
         if checked:
@@ -1038,6 +1048,9 @@ class MainWindow(QMainWindow):
     def _on_track_muted(self, idx: int, muted: bool, btn: QPushButton):
         self._player.mute_track(idx, muted)
         btn.setStyleSheet("background: #8b0000; color: white;" if muted else "")
+
+    def _on_track_instrument_changed(self, idx: int, instrument: str):
+        self._player.set_track_instrument(idx, instrument)
 
     def _add_fretboard(self, track_idx: int, name: str):
         if track_idx in self._fretboards or self._song is None:
@@ -1071,6 +1084,9 @@ class MainWindow(QMainWindow):
 
         self._track_events[track_idx] = (events, tempo)
         self._player.load_track(track_idx, events)
+        if track_idx in self._track_rows:
+            instrument = self._track_rows[track_idx][2].currentData()
+            self._player.set_track_instrument(track_idx, instrument)
         self._seek_slider.setRange(0, int(self._player.total_ms))
         self._loop_bar.set_total(self._player.total_ms)
         QTimer.singleShot(0, self._resize_to_fit)
@@ -1310,8 +1326,9 @@ class MainWindow(QMainWindow):
     def _save_current_state(self):
         if self._current_path is None:
             return
-        enabled = [i for i, (cb, _) in self._track_rows.items() if cb.isChecked()]
-        muted = [i for i, (_, btn) in self._track_rows.items() if btn.isChecked()]
+        enabled = [i for i, (cb, _, _c) in self._track_rows.items() if cb.isChecked()]
+        muted = [i for i, (_c, btn, _i) in self._track_rows.items() if btn.isChecked()]
+        instruments = {i: combo.currentData() for i, (_c, _b, combo) in self._track_rows.items()}
         pos = self._player._now() if self._player.is_playing else self._player._offset_ms
         self._prefs.setdefault("states", {})[self._current_path] = {
             "position_ms": pos,
@@ -1322,6 +1339,7 @@ class MainWindow(QMainWindow):
             "markers": list(self._loop_bar._markers),
             "active_segment": self._loop_bar._active_segment,
             "loop_enabled": self._loop_btn.isChecked(),
+            "instruments": instruments,
         }
 
     def _restore_state(self, state: dict):
@@ -1333,11 +1351,19 @@ class MainWindow(QMainWindow):
 
         tracks = set(state.get("tracks", []))
         muted = set(state.get("muted", []))
-        for idx, (cb, mute_btn) in self._track_rows.items():
+        instruments = state.get("instruments", {})
+        for idx, (cb, mute_btn, instr_combo) in self._track_rows.items():
             if idx in tracks:
                 cb.setChecked(True)
             if idx in muted:
                 mute_btn.setChecked(True)
+            saved_instr = instruments.get(str(idx)) or instruments.get(idx)
+            if saved_instr:
+                i = instr_combo.findData(saved_instr)
+                if i < 0:
+                    i = instr_combo.findText(saved_instr)
+                if i >= 0:
+                    instr_combo.setCurrentIndex(i)
 
         if not tracks and self._track_rows:
             first = min(self._track_rows)

@@ -11,6 +11,7 @@ _SAMPLE_RATE = 44100
 _TONE_SECS = 2.5
 _VIBRATO_HZ = 5.5
 _VIBRATO_DEPTH = 0.4
+_AMP = 4000
 
 # ── pygame / numpy backend ────────────────────────────────────────────────────
 try:
@@ -71,7 +72,7 @@ def _make_fx_tone(base_pitch: int, duration_ms: float, fx: "NoteEffects") -> "py
     peak = np.abs(wave).max()
     if peak:
         wave /= peak
-    return pygame.mixer.Sound(buffer=(wave * 8000).astype(np.int16).tobytes())
+    return pygame.mixer.Sound(buffer=(wave * _AMP).astype(np.int16).tobytes())
 
 
 def _make_click(freq: float, duration: float = 0.022) -> "pygame.mixer.Sound":
@@ -82,7 +83,94 @@ def _make_click(freq: float, duration: float = 0.022) -> "pygame.mixer.Sound":
     peak = np.abs(wave).max()
     if peak:
         wave /= peak
-    return pygame.mixer.Sound(buffer=(wave * 11000).astype(np.int16).tobytes())
+    return pygame.mixer.Sound(buffer=(wave * int(_AMP * 1.4)).astype(np.int16).tobytes())
+
+
+_DRUM_RNG: Dict[int, "np.ndarray"] = {}
+
+
+def _drum_noise(seed: int, n: int) -> "np.ndarray":
+    if seed not in _DRUM_RNG:
+        _DRUM_RNG[seed] = np.random.default_rng(seed).standard_normal(65536).astype(np.float32)
+    buf = _DRUM_RNG[seed]
+    if n <= len(buf):
+        return buf[:n]
+    reps = (n // len(buf)) + 1
+    return np.tile(buf, reps)[:n]
+
+
+def _make_drum_tone(midi_pitch: int) -> "pygame.mixer.Sound":
+    sr = _SAMPLE_RATE
+    if midi_pitch in (35, 36):          # kick
+        dur, decay = 0.30, 18
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        freq = 120 * np.exp(-t * 22)
+        phase = np.cumsum(2 * np.pi * freq / sr)
+        env = np.exp(-t * decay)
+        wave = env * (np.sin(phase) + 0.25 * _drum_noise(midi_pitch, n) * np.exp(-t * 60))
+    elif midi_pitch in (37, 38, 39, 40):  # snare / side-stick / clap
+        dur = 0.14
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        env = np.exp(-t * 28)
+        noise = _drum_noise(midi_pitch, n)
+        tone = np.sin(2 * np.pi * 190 * t) + 0.4 * np.sin(2 * np.pi * 160 * t)
+        wave = env * (0.55 * noise + 0.45 * tone)
+    elif midi_pitch in (42, 44):        # hi-hat closed / pedal
+        dur = 0.045
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        env = np.exp(-t * 90)
+        wave = env * _drum_noise(midi_pitch, n)
+    elif midi_pitch == 46:              # hi-hat open
+        dur = 0.22
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        env = np.exp(-t * 14)
+        wave = env * _drum_noise(midi_pitch, n)
+    elif midi_pitch in (49, 52, 55, 57):  # crash cymbal
+        dur = 0.55
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        env = np.exp(-t * 7)
+        shimmer = 0.2 * np.sin(2 * np.pi * 7800 * t) + 0.1 * np.sin(2 * np.pi * 5200 * t)
+        wave = env * (_drum_noise(midi_pitch, n) + shimmer)
+    elif midi_pitch in (51, 53, 59):    # ride cymbal
+        dur = 0.40
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        env = np.exp(-t * 9)
+        shimmer = 0.35 * np.sin(2 * np.pi * 9500 * t)
+        wave = env * (0.65 * _drum_noise(midi_pitch, n) + shimmer)
+    else:                               # toms and everything else
+        freq_map = {41: 78, 43: 92, 45: 110, 47: 130, 48: 150, 50: 170}
+        freq = freq_map.get(midi_pitch, 115)
+        dur = 0.18
+        n = int(sr * dur)
+        t = np.linspace(0, dur, n, endpoint=False)
+        env = np.exp(-t * 22)
+        wave = env * (np.sin(2 * np.pi * freq * t) + 0.25 * _drum_noise(midi_pitch, n))
+
+    peak = np.abs(wave).max()
+    if peak:
+        wave /= peak
+    return pygame.mixer.Sound(buffer=(wave * int(_AMP * 0.875)).astype(np.int16).tobytes())
+
+
+def _make_bass_tone(freq: float) -> "pygame.mixer.Sound":
+    t = np.linspace(0, _TONE_SECS, int(_SAMPLE_RATE * _TONE_SECS), endpoint=False)
+    env = np.exp(-t * 1.8)
+    attack = np.exp(-t * 80) * 0.3
+    wave = (env + attack) * (
+        np.sin(2 * np.pi * freq * t)
+        + 0.18 * np.sin(4 * np.pi * freq * t)
+        + 0.05 * np.sin(6 * np.pi * freq * t)
+    )
+    peak = np.abs(wave).max()
+    if peak:
+        wave /= peak
+    return pygame.mixer.Sound(buffer=(wave * _AMP).astype(np.int16).tobytes())
 
 
 def _make_dead_tone() -> "pygame.mixer.Sound":
@@ -96,7 +184,7 @@ def _make_dead_tone() -> "pygame.mixer.Sound":
     peak = np.abs(wave).max()
     if peak:
         wave /= peak
-    return pygame.mixer.Sound(buffer=(wave * 6000).astype(np.int16).tobytes())
+    return pygame.mixer.Sound(buffer=(wave * int(_AMP * 0.75)).astype(np.int16).tobytes())
 
 
 def _make_tone(freq: float) -> "pygame.mixer.Sound":
@@ -111,7 +199,7 @@ def _make_tone(freq: float) -> "pygame.mixer.Sound":
     peak = np.abs(wave).max()
     if peak:
         wave /= peak
-    return pygame.mixer.Sound(buffer=(wave * 8000).astype(np.int16).tobytes())
+    return pygame.mixer.Sound(buffer=(wave * _AMP).astype(np.int16).tobytes())
 
 
 def _midi_freq(pitch: int) -> float:
@@ -178,6 +266,10 @@ class Player(QObject):
 
         self.pitch_offset: int = 0
         self._muted: set = set()
+        self._drum_tracks: set = set()
+        self._drum_cache: Dict[int, "pygame.mixer.Sound"] = {}
+        self._bass_tracks: set = set()
+        self._bass_cache: Dict[int, "pygame.mixer.Sound"] = {}
 
         self._tracks: Dict[int, List[NoteEvent]] = {}
         self._event_idx: Dict[int, int] = {}
@@ -238,6 +330,8 @@ class Player(QObject):
         self._pg_slot.clear()
         self._free_pg = list(range(_MAX_PG_TRACKS))
         self._muted.clear()
+        self._drum_tracks.clear()
+        self._bass_tracks.clear()
         self.total_ms = 0.0
 
     def mute_track(self, track_idx: int, muted: bool):
@@ -246,6 +340,17 @@ class Player(QObject):
             self._silence_track(track_idx)
         else:
             self._muted.discard(track_idx)
+
+    def set_track_instrument(self, track_idx: int, instrument: str):
+        if instrument == "Drums":
+            self._drum_tracks.add(track_idx)
+            self._bass_tracks.discard(track_idx)
+        elif instrument == "Bass":
+            self._bass_tracks.add(track_idx)
+            self._drum_tracks.discard(track_idx)
+        else:
+            self._drum_tracks.discard(track_idx)
+            self._bass_tracks.discard(track_idx)
 
     def load_metronome(self, events: List[BeatEvent]):
         self._metro_events = events
@@ -383,6 +488,20 @@ class Player(QObject):
             is_dead = fx and fx.dead
             if is_dead:
                 sound = self._dead_tone
+            elif track_idx in self._drum_tracks:
+                drum_pitch = ev.midi_pitch
+                if drum_pitch not in self._drum_cache:
+                    self._drum_cache[drum_pitch] = _make_drum_tone(drum_pitch)
+                sound = self._drum_cache[drum_pitch]
+            elif track_idx in self._bass_tracks:
+                pitch = max(0, min(127, ev.midi_pitch + self.pitch_offset))
+                has_pitch_fx = fx and (fx.bend or fx.slide_in or fx.slide_out or fx.vibrato)
+                if has_pitch_fx:
+                    sound = _make_fx_tone(pitch, ev.duration_ms, fx)
+                else:
+                    if pitch not in self._bass_cache:
+                        self._bass_cache[pitch] = _make_bass_tone(_midi_freq(pitch))
+                    sound = self._bass_cache[pitch]
             else:
                 pitch = max(0, min(127, ev.midi_pitch + self.pitch_offset))
                 has_pitch_fx = fx and (fx.bend or fx.slide_in or fx.slide_out or fx.vibrato)
