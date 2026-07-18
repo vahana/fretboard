@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "==3.13.*"
 # dependencies = [
 #   "PyGuitarPro>=0.7.2",
 #   "PyQt6>=6.6.0",
