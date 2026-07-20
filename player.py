@@ -131,6 +131,12 @@ class Player(QObject):
         self._instr_cache.clear()
         self.total_ms = 0.0
 
+    def clear_cache(self):
+        self._drum_cache.clear()
+        self._instr_cache.clear()
+        for track_idx in list(self._tracks.keys()):
+            self._cache_tones(track_idx)
+
     def mute_track(self, track_idx: int, muted: bool):
         if muted:
             self._muted.add(track_idx)

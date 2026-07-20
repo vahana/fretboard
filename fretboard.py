@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QLabel, QFileDialog, QListWidget, QListWidgetItem,
     QMessageBox, QScrollArea, QFrame, QSlider, QSizePolicy, QStyle,
     QMenu, QCheckBox, QComboBox, QDialog, QLineEdit, QTreeWidget, QTreeWidgetItem,
-    QToolTip, QSplitter,
+    QToolTip, QSplitter, QProgressDialog,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QShortcut, QKeySequence
@@ -406,6 +406,7 @@ class _SeekSlider(QSlider):
 
 from fretboard_widget import FretboardWidget
 from player import Player
+import synth as _synth
 from parser import load_song, parse_track, parse_beats, parse_sections
 
 
@@ -777,8 +778,11 @@ class MainWindow(QMainWindow):
         self._recent_menu = QMenu(self)
         self._recent_btn.setMenu(self._recent_menu)
         top.addWidget(self._recent_btn)
-        self._gprotab_btn = QPushButton("Search GProTab…")
+        self._gprotab_btn = QPushButton("Search…")
         top.addWidget(self._gprotab_btn)
+        self._fluidsynth_btn = QPushButton("FluidSynth")
+        self._fluidsynth_btn.setCheckable(True)
+        top.addWidget(self._fluidsynth_btn)
         top.addStretch()
         self._help_btn = QPushButton("?")
         self._help_btn.setFixedWidth(28)
@@ -906,6 +910,7 @@ class MainWindow(QMainWindow):
     def _connect(self):
         self._open_btn.clicked.connect(self._open_file)
         self._gprotab_btn.clicked.connect(self._open_gprotab)
+        self._fluidsynth_btn.toggled.connect(self._on_fluidsynth_toggled)
         self._help_btn.clicked.connect(self._show_help)
         self._play_btn.clicked.connect(self._toggle_play)
         self._stop_btn.clicked.connect(self._stop)
@@ -1405,6 +1410,48 @@ class MainWindow(QMainWindow):
         self._prefs["master_volume"] = value
         self._save_prefs()
 
+    def _on_fluidsynth_toggled(self, checked: bool):
+        if checked and not _synth._FS_AVAILABLE:
+            dlg = QProgressDialog("Installing FluidSynth system library…", None, 0, 0, self)
+            dlg.setWindowTitle("FluidSynth")
+            dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dlg.setMinimumDuration(0)
+            dlg.setValue(0)
+
+            class _InstallWorker(QThread):
+                done = pyqtSignal(bool, str)
+                def run(self):
+                    ok, msg = _synth.install_fluidsynth_system_lib()
+                    if ok:
+                        _synth.reload_fluidsynth_binding()
+                    self.done.emit(ok, msg)
+
+            worker = _InstallWorker()
+
+            def _on_done(ok, msg):
+                dlg.close()
+                if ok:
+                    _synth.set_fluidsynth_enabled(True)
+                    self._prefs["fluidsynth"] = True
+                    self._save_prefs()
+                    self._player.clear_cache()
+                else:
+                    self._fluidsynth_btn.blockSignals(True)
+                    self._fluidsynth_btn.setChecked(False)
+                    self._fluidsynth_btn.blockSignals(False)
+                    QMessageBox.warning(self, "FluidSynth", f"Install failed:\n{msg}")
+
+            worker.done.connect(_on_done)
+            worker.start()
+            self._fs_install_worker = worker
+            dlg.exec()
+            return
+
+        _synth.set_fluidsynth_enabled(checked)
+        self._prefs["fluidsynth"] = checked
+        self._save_prefs()
+        self._player.clear_cache()
+
     # ----------------------------------------------------------------- prefs / state
 
     def _load_prefs(self):
@@ -1418,6 +1465,11 @@ class MainWindow(QMainWindow):
         self._master_vol_slider.setValue(vol)
         self._master_vol_lbl.setText(f"{vol}%")
         self._player.master_volume = vol / 100.0
+        fs_on = self._prefs.get("fluidsynth", True)
+        _synth.set_fluidsynth_enabled(fs_on)
+        self._fluidsynth_btn.blockSignals(True)
+        self._fluidsynth_btn.setChecked(fs_on)
+        self._fluidsynth_btn.blockSignals(False)
 
     def _save_prefs(self):
         try:

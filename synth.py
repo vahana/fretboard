@@ -244,6 +244,7 @@ _SF2_PATHS = [
 _FS_SYNTH = None
 _FS_SFID = None
 FS_AUDIO = False
+USE_FLUIDSYNTH = True
 
 try:
     import fluidsynth as _fluidsynth
@@ -252,8 +253,62 @@ except ImportError:
     _FS_AVAILABLE = False
 
 
+def set_fluidsynth_enabled(enabled: bool) -> None:
+    global USE_FLUIDSYNTH, _FS_SYNTH, _FS_SFID, FS_AUDIO
+    USE_FLUIDSYNTH = enabled
+    if not enabled:
+        if _FS_SYNTH is not None:
+            try:
+                _FS_SYNTH.delete()
+            except Exception:
+                pass
+        _FS_SYNTH = None
+        _FS_SFID = None
+        FS_AUDIO = False
+
+
+def install_fluidsynth_system_lib() -> tuple:
+    """Try to install the FluidSynth system library. Returns (ok: bool, message: str)."""
+    import subprocess
+    import sys
+    platform = sys.platform
+    if platform == "darwin":
+        result = subprocess.run(
+            ["brew", "install", "fluid-synth"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return False, result.stderr.strip() or "brew install failed"
+        return True, "Installed via Homebrew"
+    elif platform.startswith("linux"):
+        result = subprocess.run(
+            ["sudo", "apt-get", "install", "-y", "fluidsynth"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return False, result.stderr.strip() or "apt install failed"
+        return True, "Installed via apt"
+    return False, f"Unsupported platform: {platform}"
+
+
+def reload_fluidsynth_binding() -> bool:
+    """Re-import fluidsynth binding after system lib install. Returns True if available."""
+    global _FS_AVAILABLE, _fluidsynth
+    try:
+        import importlib
+        import fluidsynth as _fs_mod
+        importlib.reload(_fs_mod)
+        _fluidsynth = _fs_mod
+        _FS_AVAILABLE = True
+    except ImportError:
+        _FS_AVAILABLE = False
+    return _FS_AVAILABLE
+
+
 def _get_fs():
     global _FS_SYNTH, _FS_SFID, FS_AUDIO
+    if not USE_FLUIDSYNTH:
+        return None, None
     if _FS_SYNTH is not None:
         return _FS_SYNTH, _FS_SFID
     if not _FS_AVAILABLE:
